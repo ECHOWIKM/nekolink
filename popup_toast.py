@@ -74,7 +74,7 @@ _AVATAR = 48  # 通知卡片左上角图标统一显示尺寸
 _PAD = _PAD_X
 _RADIUS = 16  # 通知卡片四周圆角
 _BAR_RADIUS = 12  # 「全部隐藏」按钮圆角
-_TOP_BAR_FONT_SIZE = 15  # 「全部隐藏」文字字号
+_TOP_BAR_FONT_SIZE = 16  # 「全部隐藏」文字字号
 _SHADOW_PAD = 8
 _CARD_OUTLINE = (209, 213, 219)  # #d1d5db
 _DURATION_MS = 8000  # 默认 8 秒；运行时以 NotificationManager.duration_ms 为准
@@ -160,11 +160,19 @@ BUNDLE_NAME_MAP = {
 }
 
 
+def get_ellipsis_text(full_text: str, max_len: int = 50) -> str:
+    """展示层省略号；不改写存储原文。与 ancs_bridge.get_ellipsis_text 行为一致。"""
+    if not full_text:
+        return ""
+    text = str(full_text)
+    if len(text) > max_len:
+        return text[:max_len] + "…"
+    return text
+
+
 def _truncate(s: str, limit: int) -> str:
-    s = (s or "").strip()
-    if len(s) <= limit:
-        return s
-    return s[: limit - 1] + "…"
+    """仅用于展示层短标签（如 app 名）；勿用于通知正文存储。"""
+    return get_ellipsis_text((s or "").strip(), max(1, int(limit)))
 
 
 def normalize_popup_position(pos: str) -> str:
@@ -241,11 +249,7 @@ def parse_notification_auto_close_seconds(raw) -> Tuple[Optional[int], Optional[
 
 
 def _preview_msg(msg: str, max_chars: int) -> str:
-    msg = msg or ""
-    limit = normalize_max_preview_chars(max_chars)
-    if len(msg) > limit:
-        return msg[:limit] + "…"
-    return msg
+    return get_ellipsis_text(msg or "", normalize_max_preview_chars(max_chars))
 
 
 def _content_wrap_width(card_width: int) -> int:
@@ -426,13 +430,23 @@ def _parse_fields(body_text: str) -> dict:
 
 
 def _compose_message(payload: dict) -> Tuple[str, str, str, str]:
-    """返回 app_name, title字段, msg字段, meta。"""
+    """返回 app_name, title字段, msg字段, meta。title/msg 保持完整原文，截断只在绘制时做。"""
     app_name = _truncate(payload.get("app_name") or "通知", 40)
     parsed = _parse_fields(payload.get("body_text") or "")
     device = (payload.get("device_name") or parsed["device"] or "").strip()
     ts = (payload.get("timestamp") or parsed["date"] or "").strip()
-    title = _truncate((payload.get("title") or parsed["title"] or "").strip(), 120)
-    msg = _truncate((payload.get("msg") or parsed["msg"] or "").strip(), 300)
+    title = (
+        payload.get("raw_title")
+        or payload.get("title")
+        or parsed["title"]
+        or ""
+    ).strip()
+    msg = (
+        payload.get("raw_msg")
+        or payload.get("msg")
+        or parsed["msg"]
+        or ""
+    ).strip()
     meta = " · ".join(x for x in (device, ts) if x)
     return app_name, title, msg, meta
 
@@ -1233,6 +1247,8 @@ class NotificationManager:
             "app_name": app_name,
             "title": title,
             "msg": msg,
+            "raw_title": title,
+            "raw_msg": msg,
             "icon_path": icon_path,
             "notif_id": notif_id,
             "body_text": body_text,

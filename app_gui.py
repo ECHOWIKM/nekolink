@@ -23,8 +23,11 @@ from ancs_bridge import (
     get_app_display_name,
     get_device_display_name,
     get_config_path,
+    get_ellipsis_text,
     load_config,
     render_push_template,
+    resolve_raw_msg,
+    resolve_raw_title,
     save_config,
     send_dingtalk_text,
     send_email,
@@ -501,6 +504,7 @@ class App(tb.Window):
         self.preview = tk.Text(right, height=8, wrap="word")
         self.preview.pack(fill=X, pady=(8, 8))
         self.preview.insert("end", "（暂无）\n")
+        self.preview.bind("<Double-1>", lambda _e: self._show_last_notification_detail())
 
         self.ui["lbl_push_preview"] = tb.Label(right, text="推送预览", font=("Segoe UI", 12, "bold"))
         self.ui["lbl_push_preview"].pack(anchor=W)
@@ -700,6 +704,18 @@ class App(tb.Window):
         tb.Button(nf, text="Test", bootstyle="success", command=self.test_ntfy).grid(
             row=2, column=1, sticky=W, pady=(8, 0)
         )
+
+        wh = tb.Labelframe(frm, text="Webhook 消息长度", padding=10)
+        wh.pack(fill=X, pady=(0, 12))
+        self.var_webhook_full = tk.BooleanVar(
+            value=bool(getattr(self.cfg, "webhook_use_full_message", True))
+        )
+        tb.Checkbutton(
+            wh,
+            text="Webhook/TG/Gotify/邮件发送完整原文（关闭则发送预览省略文本）",
+            variable=self.var_webhook_full,
+            bootstyle="round-toggle",
+        ).pack(anchor=W)
 
         # Gotify
         gf = tb.Labelframe(frm, text="Gotify", padding=10)
@@ -1363,6 +1379,16 @@ class App(tb.Window):
         if not sel:
             return
         raw = self._hist_raw.get(sel[0], {})
+        self._show_notification_detail(
+            resolve_raw_title(raw),
+            resolve_raw_msg(raw),
+            meta={
+                "time": raw.get("time") or "",
+                "app": raw.get("app_name") or "",
+                "device": raw.get("device_name") or "",
+            },
+        )
+        # 顺带填充应用映射表（旧行为保留）
         bundle_id = raw.get("app") or ""
         if not bundle_id:
             return
@@ -1372,6 +1398,45 @@ class App(tb.Window):
         self.var_map_block.set(bundle_id in block_set)
         self.var_map_icon.set((getattr(self.cfg, "app_icon_map", {}) or {}).get(bundle_id, ""))
         self._set_map_sound_var(bundle_id)
+
+    def _show_last_notification_detail(self, _evt=None):
+        payload = getattr(self, "_last_payload", None) or {}
+        if not payload:
+            return
+        self._show_notification_detail(
+            resolve_raw_title(payload),
+            resolve_raw_msg(payload),
+            meta={"app": get_app_display_name(payload.get("app") or "", self.cfg)},
+        )
+
+    def _show_notification_detail(self, raw_title: str, raw_msg: str, meta: Optional[dict] = None):
+        """详情弹窗：展示完整 raw 原文，不做截断。"""
+        meta = meta or {}
+        win = tk.Toplevel(self)
+        win.title("通知详情（完整原文）")
+        win.geometry("560x420")
+        win.transient(self)
+        frm = tb.Frame(win, padding=12)
+        frm.pack(fill=BOTH, expand=True)
+        bits = [f"{k}: {v}" for k, v in meta.items() if v]
+        if bits:
+            tb.Label(frm, text=" · ".join(bits), bootstyle="secondary").pack(anchor=W, pady=(0, 8))
+        tb.Label(frm, text="标题（全文）", font=("Segoe UI", 10, "bold")).pack(anchor=W)
+        title_box = tk.Text(frm, height=3, wrap="word")
+        title_box.pack(fill=X, pady=(2, 8))
+        title_box.insert("end", raw_title or "")
+        title_box.configure(state="disabled")
+        tb.Label(frm, text="内容（全文）", font=("Segoe UI", 10, "bold")).pack(anchor=W)
+        msg_box = tk.Text(frm, height=12, wrap="word")
+        msg_box.pack(fill=BOTH, expand=True, pady=(2, 8))
+        msg_box.insert("end", raw_msg or "")
+        msg_box.configure(state="disabled")
+        tb.Label(
+            frm,
+            text=f"字符数：标题 {len(raw_title or '')} / 内容 {len(raw_msg or '')}",
+            bootstyle="secondary",
+        ).pack(anchor=W)
+        tb.Button(frm, text="关闭", bootstyle="secondary", command=win.destroy).pack(anchor=E, pady=(8, 0))
 
     def upsert_app_map(self):
         bundle_id = self.var_map_bundle.get().strip()
@@ -1497,15 +1562,21 @@ class App(tb.Window):
         device_name = get_device_display_name(device_raw, self.cfg)
         app_name = get_app_display_name(app_raw, self.cfg)
         date_fmt = format_ancs_date(payload.get("date") or "")
-
+        raw_title = resolve_raw_title(payload)
+        raw_msg = resolve_raw_msg(payload)
+        preview_n = normalize_max_preview_chars(
+            getattr(self.cfg, "max_preview_chars", 50)
+        )
+        # 主页预览仅展示省略文本；详情/历史存储用 raw 全文
         preview_text = (
             f"Device: {device_name}\n"
             f"Battery: {bat_text}\n"
             f"App: {app_name} ({app_raw})\n"
-            f"Title: {payload.get('title')}\n"
-            f"Msg: {payload.get('msg')}\n"
+            f"Title: {get_ellipsis_text(raw_title, preview_n)}\n"
+            f"Msg: {get_ellipsis_text(raw_msg, preview_n)}\n"
             f"Codes: {' '.join(payload.get('codes') or [])}\n"
             f"Date: {date_fmt}\n"
+            f"（双击此处查看完整原文）\n"
         )
         self.preview.delete("1.0", "end")
         self.preview.insert("end", preview_text)
@@ -1514,14 +1585,16 @@ class App(tb.Window):
         t = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(payload["ts"]))
         codes = " ".join(payload.get("codes") or [])
 
-        # 写入内存历史（导出用），超限丢弃最旧
+        # 写入内存历史（导出用），超限丢弃最旧 — 必须存完整 raw
         hist_row = {
             "time": t,
             "device": device_name,
             "app_name": app_name,
             "app_bundle": app_raw,
-            "title": payload.get("title") or "",
-            "msg": payload.get("msg") or "",
+            "title": raw_title,
+            "msg": raw_msg,
+            "raw_title": raw_title,
+            "raw_msg": raw_msg,
         }
         self.history.append(hist_row)
         while len(self.history) > MAX_HISTORY_COUNT:
@@ -1529,14 +1602,31 @@ class App(tb.Window):
         self._append_auto_backup_row(hist_row)
 
         iid = self.tree.insert(
-            "", "end",
-            values=(t, device_name, bat_text, app_name,
-                    payload.get("title", ""), payload.get("msg", ""), codes)
+            "",
+            "end",
+            values=(
+                t,
+                device_name,
+                bat_text,
+                app_name,
+                get_ellipsis_text(raw_title, preview_n),
+                get_ellipsis_text(raw_msg, preview_n),
+                codes,
+            ),
         )
         self._hist_raw[iid] = {
             "app": app_raw,
             "device": device_raw,
             "notif_id": payload.get("notif_id") or "",
+            "raw_title": raw_title,
+            "raw_msg": raw_msg,
+            "title": raw_title,
+            "msg": raw_msg,
+            "time": t,
+            "app_name": app_name,
+            "codes": codes,
+            "battery": bat_text,
+            "device_name": device_name,
         }
         nid = payload.get("notif_id")
         if nid:
@@ -1853,8 +1943,8 @@ class App(tb.Window):
                         row.get("device", ""),
                         row.get("app_name", ""),
                         row.get("app_bundle", ""),
-                        row.get("title", ""),
-                        row.get("msg", ""),
+                        resolve_raw_title(row),
+                        resolve_raw_msg(row),
                     ]
                 )
         except Exception as e:
@@ -1905,8 +1995,8 @@ class App(tb.Window):
                             row.get("device", ""),
                             row.get("app_name", ""),
                             row.get("app_bundle", ""),
-                            row.get("title", ""),
-                            row.get("msg", ""),
+                            resolve_raw_title(row),
+                            resolve_raw_msg(row),
                         ]
                     )
             messagebox.showinfo(
@@ -2142,6 +2232,10 @@ class App(tb.Window):
             gotify_url=self.var_gotify_url.get().strip(),
             gotify_token=self.var_gotify_token.get().strip(),
             gotify_priority=self.safe_int(self.var_gotify_prio.get(), 5),
+
+            webhook_use_full_message=bool(
+                self.var_webhook_full.get() if hasattr(self, "var_webhook_full") else True
+            ),
 
             enable_email=bool(self.var_mail_on.get()),
             smtp_host=self.var_smtp_host.get().strip(),

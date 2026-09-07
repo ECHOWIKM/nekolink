@@ -50,6 +50,7 @@
   "max_preview_chars": 50,
   "max_pop_notification": 3,
   "notification_auto_close_seconds": 8,
+  "webhook_use_full_message": true,
   "sound_enable": true,
   "sound_volume": 80,
   "sound_selected_file": "notify.wav",

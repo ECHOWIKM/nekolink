@@ -29,6 +29,24 @@ except Exception:
     show_toast = None  # type: ignore
 
 
+def get_ellipsis_text(full_text: str, max_len: int = 50) -> str:
+    """仅用于 UI/Webhook 展示层的省略；禁止用于改写存储中的原始文本。"""
+    if not full_text:
+        return ""
+    text = str(full_text)
+    if len(text) > max_len:
+        return text[:max_len] + "…"
+    return text
+
+
+def resolve_raw_title(obj: dict) -> str:
+    return str((obj or {}).get("raw_title") or (obj or {}).get("title") or "")
+
+
+def resolve_raw_msg(obj: dict) -> str:
+    return str((obj or {}).get("raw_msg") or (obj or {}).get("msg") or "")
+
+
 # 应用映射 / 设备别名 / webhook 黑名单请在 GUI 配置并保存到 config.json
 
 
@@ -200,13 +218,23 @@ def build_template_context(payload: dict, cfg: Optional["BridgeConfig"] = None) 
     bat_text = f"{bat}%" if isinstance(bat, int) else ""
     date_raw = payload.get("date") or ""
     ts = payload.get("ts") or time.time()
+    raw_title = resolve_raw_title(payload)
+    raw_msg = resolve_raw_msg(payload)
+    # Webhook/模板默认发全文；仅当开关关闭时用预览省略
+    use_full = True if cfg is None else bool(getattr(cfg, "webhook_use_full_message", True))
+    if use_full:
+        title, msg = raw_title, raw_msg
+    else:
+        preview_n = int(getattr(cfg, "max_preview_chars", 50) or 50)
+        title = get_ellipsis_text(raw_title, preview_n)
+        msg = get_ellipsis_text(raw_msg, preview_n)
     return {
         "device": get_device_display_name(device_raw, cfg),
         "device_mac": device_raw,
         "app": get_app_display_name(app_id, cfg),
         "app_id": app_id,
-        "title": payload.get("title") or "",
-        "msg": payload.get("msg") or "",
+        "title": title,
+        "msg": msg,
         "date": format_ancs_date(date_raw),
         "date_raw": date_raw,
         "battery": bat_text,
@@ -502,6 +530,9 @@ class BridgeConfig:
     gotify_token: str = ""
     gotify_priority: int = 5
 
+    # webhook / TG / Gotify / Email：true=发 raw 全文；false=发预览省略文本
+    webhook_use_full_message: bool = True
+
     # behavior
     dedup_seconds: int = 8
 
@@ -672,6 +703,14 @@ def _extract_codes(text: str, regex: str) -> List[str]:
 
 
 def _format_message(payload: dict, cfg: BridgeConfig) -> str:
+    raw_title = resolve_raw_title(payload)
+    raw_msg = resolve_raw_msg(payload)
+    if bool(getattr(cfg, "webhook_use_full_message", True)):
+        title, msg = raw_title, raw_msg
+    else:
+        n = int(getattr(cfg, "max_preview_chars", 50) or 50)
+        title = get_ellipsis_text(raw_title, n)
+        msg = get_ellipsis_text(raw_msg, n)
     lines = []
     lines.append("📲 iPhone 通知")
     if payload.get("device"):
@@ -682,10 +721,10 @@ def _format_message(payload: dict, cfg: BridgeConfig) -> str:
             lines.append(f"Battery: {bat}%")
     if payload.get("app"):
         lines.append(f"App: {payload.get('app')}")
-    if payload.get("title"):
-        lines.append(f"Title: {payload.get('title')}")
-    if payload.get("msg"):
-        lines.append(f"Msg: {payload.get('msg')}")
+    if title:
+        lines.append(f"Title: {title}")
+    if msg:
+        lines.append(f"Msg: {msg}")
     if payload.get("date"):
         lines.append(f"Date: {payload.get('date')}")
     return "\n".join(lines)
@@ -784,8 +823,9 @@ class _ANCSSession:
         if not self.client or not self.client.is_connected:
             return
         try:
-            title_len = 64
-            msg_len = 256
+            # ANCS MaxLength 为 uint16；请求上限以免在协议层丢弃后半段
+            title_len = 65535
+            msg_len = 65535
 
             payload = bytearray()
             payload.append(0x00)
@@ -850,11 +890,17 @@ class _ANCSSession:
     async def _emit_notification(self, uid: int, attrs: Dict[int, str]):
         try:
             app = attrs.get(ATTR_APP_IDENTIFIER, "") or ""
-            title = attrs.get(ATTR_TITLE, "") or ""
-            msg = attrs.get(ATTR_MESSAGE, "") or ""
+            # 铁则：解析阶段绝不切片截断；完整原文写入 raw_* / title / msg
+            raw_title = attrs.get(ATTR_TITLE, "") or ""
+            raw_msg = attrs.get(ATTR_MESSAGE, "") or ""
             date = attrs.get(ATTR_DATE, "") or ""
+            print(f"[NOTIFY-RAW] msg len={len(raw_msg)} content={raw_msg}", flush=True)
+            try:
+                self.log(f"[NOTIFY-RAW] msg len={len(raw_msg)}")
+            except Exception:
+                pass
 
-            merged_text = "\n".join([app, title, msg, date]).strip()
+            merged_text = "\n".join([app, raw_title, raw_msg, date]).strip()
             if _contains_block_keyword(merged_text, self.cfg.block_keywords, self.cfg.block_case_insensitive):
                 self.log(f"[{self.addr}] [FILTER] blocked")
                 return
@@ -871,8 +917,10 @@ class _ANCSSession:
                 "device": self.addr,
                 "battery": bat,
                 "app": app,
-                "title": title,
-                "msg": msg,
+                "title": raw_title,
+                "msg": raw_msg,
+                "raw_title": raw_title,
+                "raw_msg": raw_msg,
                 "date": date,
                 "codes": codes,
             }
@@ -1051,12 +1099,16 @@ class BridgeManager:
             try:
                 app_id = payload.get("app") or ""
                 app_name = get_app_display_name(app_id, cfg)
-                notif_title = payload.get("title") or ""
-                notif_msg = payload.get("msg") or ""
+                # 桌面弹窗仍传入完整 raw；省略只在渲染层做
+                notif_title = resolve_raw_title(payload)
+                notif_msg = resolve_raw_msg(payload)
                 icon_path = resolve_app_icon(app_id, app_name, cfg)
                 notif_id = payload.get("notif_id") or ""
                 template = getattr(cfg, "push_template", "") or _default_push_template()
-                body_text = render_push_template(template, payload, cfg)
+                # 桌面弹窗 body 预览用全文模板上下文（不受 webhook 缩略开关影响）
+                body_payload = dict(payload)
+                body_cfg = dataclasses.replace(cfg, webhook_use_full_message=True)
+                body_text = render_push_template(template, body_payload, body_cfg)
                 if self.on_desktop_popup is not None:
                     self.on_desktop_popup(
                         app_name,
@@ -1067,15 +1119,25 @@ class BridgeManager:
                         body_text=body_text,
                     )
                 elif show_notification_toast is not None:
+                    preview_n = int(getattr(cfg, "max_preview_chars", 50) or 50)
                     show_notification_toast(
                         app_name,
-                        notif_title,
-                        notif_msg,
+                        get_ellipsis_text(notif_title, preview_n),
+                        get_ellipsis_text(notif_msg, preview_n),
                         icon_path=icon_path,
                         log=self.log,
                     )
                 elif show_toast is not None:
-                    show_toast(app_name, _build_webhook_content(app_name, notif_title, notif_msg), log=self.log)
+                    preview_n = int(getattr(cfg, "max_preview_chars", 50) or 50)
+                    show_toast(
+                        app_name,
+                        _build_webhook_content(
+                            app_name,
+                            get_ellipsis_text(notif_title, preview_n),
+                            get_ellipsis_text(notif_msg, preview_n),
+                        ),
+                        log=self.log,
+                    )
             except Exception as e:
                 self.log(f"[TOAST] failed: {e}")
 

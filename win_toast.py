@@ -15,10 +15,17 @@ from typing import Callable, Optional
 
 _APP_ID = "NekoLink"
 _TOAST_GROUP = "NekoLinkAlerts"
-_MAX_TITLE = 120
-_MAX_MSG = 500
 _registered = False
 _app_script_path = ""
+
+
+def get_ellipsis_text(full_text: str, max_len: int = 50) -> str:
+    if not full_text:
+        return ""
+    text = str(full_text)
+    if len(text) > max_len:
+        return text[:max_len] + "…"
+    return text
 
 
 def _set_app_script_path(path: str) -> None:
@@ -28,10 +35,8 @@ def _set_app_script_path(path: str) -> None:
 
 
 def _truncate(s: str, limit: int) -> str:
-    s = (s or "").strip()
-    if len(s) <= limit:
-        return s
-    return s[: limit - 1] + "…"
+    """展示层省略；不用于改写上游存储。"""
+    return get_ellipsis_text((s or "").strip(), max(1, int(limit)))
 
 
 def _log(log: Optional[Callable[[str], None]], msg: str) -> None:
@@ -154,9 +159,10 @@ def show_notification_toast(
     log: Optional[Callable[[str], None]] = None,
 ) -> None:
     ensure_toast_ready(_app_script_path, log=log)
-    app_name = _truncate(app_name or "通知", 40)
-    title = _truncate(title, _MAX_TITLE)
-    msg = _truncate(msg, _MAX_MSG)
+    # 系统 Toast 仅展示预览；调用方应已传入预览文本，此处再兜底省略
+    app_name = get_ellipsis_text(app_name or "通知", 40)
+    title = get_ellipsis_text(title or "", 50)
+    msg = get_ellipsis_text(msg or "", 50)
     icon = (icon_path or "").strip() or _default_icon_path()
     unique = f"nk-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
     # 每条通知独立 group，避免 Win11 合并后只进通知中心、不弹横幅
