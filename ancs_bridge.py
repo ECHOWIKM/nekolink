@@ -401,6 +401,15 @@ def load_config(path: str) -> "BridgeConfig":
             cfg.notification_auto_close_seconds = max(3, min(120, v))
         except Exception:
             cfg.notification_auto_close_seconds = 8
+        # 桌面弹窗超时：优先 desktop_toast_auto_dismiss；缺省则回退旧字段
+        try:
+            if "desktop_toast_auto_dismiss" in filtered:
+                dv = int(str(getattr(cfg, "desktop_toast_auto_dismiss", 10)).strip())
+            else:
+                dv = int(str(getattr(cfg, "notification_auto_close_seconds", 10)).strip())
+            cfg.desktop_toast_auto_dismiss = max(3, min(120, dv))
+        except Exception:
+            cfg.desktop_toast_auto_dismiss = 10
         # 提示音：缺省 true / 80 / notify.wav，音量钳位 0–100
         try:
             cfg.sound_enable = bool(getattr(cfg, "sound_enable", True))
@@ -522,6 +531,8 @@ class BridgeConfig:
     # 屏幕最多同时可见弹窗数；超额进入 ui_pop_queue 排队，关闭后依次弹出（不再丢弃弹窗）
     max_pop_notification: int = 3
     notification_auto_close_seconds: int = 8
+    # 桌面自定义弹窗自动关闭秒数（与 notification_auto_close_seconds 同步写入）
+    desktop_toast_auto_dismiss: int = 10
     sound_enable: bool = True
     sound_volume: int = 80
     sound_selected_file: str = "notify.wav"

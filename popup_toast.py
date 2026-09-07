@@ -748,6 +748,124 @@ class CustomToastNotification:
 
         self._bind_hover(self.win)
         self._bind_hover(self._shell)
+        self._install_swipe_dismiss()
+
+    def _install_swipe_dismiss(self) -> None:
+        """左右滑清除：只关掉本桌面弹窗，与主页 UI 列表无关。"""
+        state = {
+            "armed": False,
+            "swiping": False,
+            "press_x": 0,
+            "press_y": 0,
+            "ox": 0,
+            "oy": 0,
+            "dx": 0,
+        }
+        threshold = 60
+
+        def _is_close_target(event) -> bool:
+            try:
+                w = self.win.winfo_containing(event.x_root, event.y_root)
+                return w is self._close
+            except Exception:
+                return False
+
+        def _on_press(event):
+            if self._destroyed or _is_close_target(event):
+                return
+            state["armed"] = True
+            state["swiping"] = False
+            state["press_x"] = event.x_root
+            state["press_y"] = event.y_root
+            state["dx"] = 0
+            try:
+                state["ox"] = self.win.winfo_x()
+                state["oy"] = self.win.winfo_y()
+            except tk.TclError:
+                state["armed"] = False
+            print(f"[DESKTOP-TOAST] press notif_id={self.notif_id!r}")
+
+        def _on_motion(event):
+            if not state["armed"] or self._destroyed:
+                return
+            dx = event.x_root - state["press_x"]
+            dy = event.y_root - state["press_y"]
+            if not state["swiping"]:
+                if abs(dy) > abs(dx) and abs(dy) > 8:
+                    state["armed"] = False
+                    print("[DESKTOP-TOAST] swipe abort (vertical)")
+                    return
+                if abs(dx) < 10:
+                    return
+                state["swiping"] = True
+                self._hovering = True
+                self._cancel_timer()
+                print(f"[DESKTOP-TOAST] swipe start dx={dx}")
+            state["dx"] = dx
+            try:
+                alpha = max(0.35, 1.0 - min(1.0, abs(dx) / 160.0) * 0.55)
+                self.win.geometry(
+                    f"{self.outer_w}x{self.outer_h}+{state['ox'] + dx}+{state['oy']}"
+                )
+                self.win.attributes("-alpha", alpha)
+            except tk.TclError:
+                pass
+
+        def _on_release(_event=None):
+            if not state["armed"] or self._destroyed:
+                return
+            was = state["swiping"]
+            dx = state["dx"]
+            state["armed"] = False
+            state["swiping"] = False
+            print(f"[DESKTOP-TOAST] release swiping={was} dx={dx}")
+            if was and abs(dx) >= threshold:
+                print(f"[DESKTOP-TOAST] swipe dismiss notif_id={self.notif_id!r}")
+                self.close(immediate=True)
+                return
+            if was:
+                try:
+                    self.win.geometry(
+                        f"{self.outer_w}x{self.outer_h}+{state['ox']}+{state['oy']}"
+                    )
+                    self.win.attributes("-alpha", 1.0)
+                except tk.TclError:
+                    pass
+                self._hovering = False
+                self._schedule_dismiss()
+                print("[DESKTOP-TOAST] swipe rebound")
+                return
+            if abs(dx) < 6:
+                self._on_body_click()
+
+        def _bind_swipe(widget: tk.Widget) -> None:
+            if widget is getattr(self, "_close", None):
+                return
+            widget.bind("<ButtonPress-1>", _on_press, add="+")
+            widget.bind("<B1-Motion>", _on_motion, add="+")
+            widget.bind("<ButtonRelease-1>", _on_release, add="+")
+            for child in widget.winfo_children():
+                if child is getattr(self, "_close", None):
+                    continue
+                _bind_swipe(child)
+
+        _bind_swipe(self._shell)
+        self._close.unbind("<ButtonPress-1>")
+        self._close.unbind("<B1-Motion>")
+        self._close.unbind("<ButtonRelease-1>")
+        self._close.bind("<Button-1>", self._on_close_click)
+        try:
+            self._close.lift()
+        except tk.TclError:
+            pass
+
+    def _on_body_click(self) -> None:
+        if self.notif_id and self.manager.on_click:
+            try:
+                print(f"[DESKTOP-TOAST] body click -> open history notif_id={self.notif_id!r}")
+                self.manager.on_click(self.notif_id)
+            except Exception:
+                pass
 
     def _build_content(
         self,
@@ -818,7 +936,7 @@ class CustomToastNotification:
             highlightthickness=0,
         )
         self._close.pack(side=tk.RIGHT)
-        self._close.bind("<Button-1>", lambda _e: self.close(immediate=False))
+        self._close.bind("<Button-1>", self._on_close_click)
         self._close.bind("<Enter>", lambda _e: self._close.configure(fg=_CLR_CLOSE_HOVER, foreground=_CLR_CLOSE_HOVER))
         self._close.bind("<Leave>", lambda _e: self._close.configure(fg=_CLR_CLOSE, foreground=_CLR_CLOSE))
 
@@ -847,23 +965,14 @@ class CustomToastNotification:
                 wraplength=max(40, wrap_w - 2),
             ).pack(anchor=tk.W, pady=(3, 0))
 
-        self._bind_body_click(inner)
+        # 正文点击打开历史：由滑动手势「轻点松开」触发，避免与左右滑冲突
+        # （不再对 body 绑定 Button-1，防止点 × 时父级抢走语义）
 
-    def _bind_body_click(self, widget: tk.Widget) -> None:
-        if widget is getattr(self, "_close", None):
-            return
-        widget.bind("<Button-1>", lambda _e: self._on_body_click())
-        for child in widget.winfo_children():
-            if child is getattr(self, "_close", None):
-                continue
-            self._bind_body_click(child)
-
-    def _on_body_click(self) -> None:
-        if self.notif_id and self.manager.on_click:
-            try:
-                self.manager.on_click(self.notif_id)
-            except Exception:
-                pass
+    def _on_close_click(self, _event=None):
+        """仅关闭桌面弹窗；绝不触碰主页通知列表 / history。"""
+        print(f"[DESKTOP-TOAST] close click notif_id={self.notif_id!r}")
+        self.close(immediate=True)
+        return "break"
 
     def _bind_hover(self, widget: tk.Widget) -> None:
         widget.bind("<Enter>", lambda _e: self._set_hover(True))
@@ -969,8 +1078,14 @@ class CustomToastNotification:
             pass
 
     def close(self, immediate: bool = False) -> None:
+        """关闭本桌面弹窗。禁止在此操作主页通知列表。"""
         if self._destroyed:
             return
+        # 点 × 时鼠标仍在窗内，_hovering 会挡住淡出；用户主动关闭时强制清掉
+        self._hovering = False
+        print(
+            f"[DESKTOP-TOAST] close immediate={immediate} notif_id={self.notif_id!r}"
+        )
         if immediate:
             self._destroy()
             return
@@ -981,6 +1096,10 @@ class CustomToastNotification:
             return
         self._destroyed = True
         self._cancel_timer()
+        print(
+            f"[DESKTOP-TOAST] destroyed notif_id={self.notif_id!r} "
+            f"(home UI list untouched)"
+        )
         self.manager._on_toast_destroyed(self)
         try:
             self.win.destroy()
@@ -1152,6 +1271,10 @@ class NotificationManager:
         meta: str,
     ) -> CustomToastNotification:
         toast = CustomToastNotification(self, payload, app_name, title_text, msg_text, meta)
+        print(
+            f"[DESKTOP-TOAST] show desktop toast "
+            f"app={app_name!r} title={title_text!r} notif_id={payload.get('notif_id')!r}"
+        )
         pos = self.popup_position
 
         # 顶部锚定：新消息在最上；底部锚定：新消息在最下
@@ -1244,10 +1367,15 @@ class NotificationManager:
         wa_bottom = wa_top + wa_h
         pos = self.popup_position
         m = _MARGIN
-        card_w = self.notification_width
+        # 外层窗口宽（含阴影垫层）；白卡片可视宽 = 外宽 - 两侧阴影
+        outer_w = self.notification_width
+        if self._items:
+            outer_w = max(40, int(getattr(self._items[0], "outer_w", outer_w) or outer_w))
+        pad = _SHADOW_PAD
+        visual_w = max(40, outer_w - pad * 2)
 
         if "right" in pos:
-            x = wa_left + wa_w - card_w - m
+            x = wa_left + wa_w - outer_w - m
             slide_from = "right"
         else:
             x = wa_left + m
@@ -1263,7 +1391,8 @@ class NotificationManager:
             bar_y = wa_top + m
             order = list(self._items)
 
-        self._hide_bar.show_at(x, bar_y, card_w)
+        # 「全部隐藏」与白卡片左右齐平：同 inset，同可视宽度（禁止用整窗宽导致比卡片更宽）
+        self._hide_bar.show_at(x + pad, bar_y, visual_w)
         y = bar_y + _BAR_H + _BAR_GAP
 
         for item in order:

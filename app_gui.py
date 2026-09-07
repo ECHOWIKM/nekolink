@@ -128,7 +128,9 @@ class App(tb.Window):
             max_preview_chars=getattr(self.cfg, "max_preview_chars", 50),
             max_pop_notification=getattr(self.cfg, "max_pop_notification", 3),
             notification_auto_close_seconds=getattr(
-                self.cfg, "notification_auto_close_seconds", 8
+                self.cfg,
+                "desktop_toast_auto_dismiss",
+                getattr(self.cfg, "notification_auto_close_seconds", 10),
             ),
         )
         self.manager = BridgeManager(
@@ -947,12 +949,16 @@ class App(tb.Window):
 
         close_row = tb.Frame(frm)
         close_row.pack(fill=X, anchor=W, pady=(0, 1))
-        self.ui["lbl_auto_close"] = tb.Label(close_row, text="通知弹窗自动显示时长(秒)")
+        self.ui["lbl_auto_close"] = tb.Label(close_row, text="桌面弹窗自动关闭(秒)")
         self.ui["lbl_auto_close"].pack(side=LEFT, padx=(0, 8))
         self.var_auto_close = tk.StringVar(
             value=str(
                 normalize_notification_auto_close_seconds(
-                    getattr(self.cfg, "notification_auto_close_seconds", 8)
+                    getattr(
+                        self.cfg,
+                        "desktop_toast_auto_dismiss",
+                        getattr(self.cfg, "notification_auto_close_seconds", 10),
+                    )
                 )
             )
         )
@@ -960,7 +966,7 @@ class App(tb.Window):
         self.ent_auto_close.pack(side=LEFT)
         self.ui["lbl_auto_close_hint"] = tb.Label(
             frm,
-            text="范围3‑120秒，到时间弹窗自动关闭",
+            text="范围3‑120秒；仅控制桌面弹窗超时，与历史/主页列表无关",
             bootstyle="secondary",
             wraplength=520,
             justify=LEFT,
@@ -1572,7 +1578,11 @@ class App(tb.Window):
                 getattr(cfg, "max_pop_notification", 3)
             )
             secs = normalize_notification_auto_close_seconds(
-                getattr(cfg, "notification_auto_close_seconds", 8)
+                getattr(
+                    cfg,
+                    "desktop_toast_auto_dismiss",
+                    getattr(cfg, "notification_auto_close_seconds", 10),
+                )
             )
             self.popup_toast.duration_ms = secs * 1000
             # 提示音：热加载写入 sound_helper 内存运行时（play 只读这里）
@@ -1637,7 +1647,11 @@ class App(tb.Window):
                 messagebox.showwarning(i18n.t("missing"), i18n.t("misc_auto_close_invalid"))
                 return
             secs = normalize_notification_auto_close_seconds(
-                getattr(self.cfg, "notification_auto_close_seconds", 8)
+                getattr(
+                    self.cfg,
+                    "desktop_toast_auto_dismiss",
+                    getattr(self.cfg, "notification_auto_close_seconds", 10),
+                )
             )
         self.var_auto_close.set(str(secs))
         cfg = self.collect_config()
@@ -1856,7 +1870,9 @@ class App(tb.Window):
             max_preview_chars=getattr(cfg, "max_preview_chars", 50),
             max_pop_notification=getattr(cfg, "max_pop_notification", 3),
             notification_auto_close_seconds=getattr(
-                cfg, "notification_auto_close_seconds", 8
+                cfg,
+                "desktop_toast_auto_dismiss",
+                getattr(cfg, "notification_auto_close_seconds", 10),
             ),
         )
 
@@ -1909,9 +1925,15 @@ class App(tb.Window):
         notif_id: str = "",
         body_text: str = "",
     ) -> None:
+        """弹出桌面自定义 toast。关闭该弹窗绝不能动 history / 任何主页列表。"""
+
         def _do():
             if not bool(self.var_win_toast.get()):
                 return
+            print(
+                f"[DESKTOP-TOAST] show desktop toast "
+                f"app={app_name!r} title={title!r} notif_id={notif_id!r}"
+            )
             self.popup_toast.show(
                 app_name,
                 title,
@@ -2150,7 +2172,10 @@ class App(tb.Window):
             max_preview_chars=normalize_max_preview_chars(self.var_max_preview.get()),
             max_pop_notification=normalize_max_pop_notification(self.var_max_pop.get()),
             notification_auto_close_seconds=normalize_notification_auto_close_seconds(
-                self.var_auto_close.get() if hasattr(self, "var_auto_close") else 8
+                self.var_auto_close.get() if hasattr(self, "var_auto_close") else 10
+            ),
+            desktop_toast_auto_dismiss=normalize_notification_auto_close_seconds(
+                self.var_auto_close.get() if hasattr(self, "var_auto_close") else 10
             ),
             sound_enable=bool(self.var_sound_enable.get()) if hasattr(self, "var_sound_enable") else True,
             sound_volume=normalize_sound_volume(
