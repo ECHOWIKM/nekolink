@@ -13,6 +13,8 @@ import re
 import threading
 import time
 import urllib.parse
+import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
@@ -21,9 +23,289 @@ import requests
 from bleak import BleakClient, BleakScanner
 
 try:
-    from win_toast import show_toast
+    from win_toast import show_notification_toast, show_toast
 except Exception:
+    show_notification_toast = None  # type: ignore
     show_toast = None  # type: ignore
+
+
+# 应用映射 / 设备别名 / webhook 黑名单请在 GUI 配置并保存到 config.json
+
+
+def _default_app_bundle_map() -> Dict[str, str]:
+    return {
+        "com.tencent.xin": "微信",
+        "com.alibaba.DingTalkTalk": "钉钉",
+        "com.tencent.mqq": "QQ",
+        "com.tencent.WeChatWork": "企业微信",
+        "com.apple.MobileSMS": "短信",
+        "com.netease.cloudmusic": "网易云音乐",
+        "com.xiaojukeji.didi": "滴滴",
+    }
+
+
+def get_app_display_name(bundle_id: str, cfg: Optional["BridgeConfig"] = None) -> str:
+    """根据 bundle_id 返回映射后的应用名，未映射则原样返回。"""
+    bundle_id = bundle_id or ""
+    mapping = _default_app_bundle_map()
+    if cfg is not None:
+        mapping = {**mapping, **(cfg.app_bundle_map or {})}
+    return mapping.get(bundle_id, bundle_id)
+
+
+def get_device_display_name(device: str, cfg: Optional["BridgeConfig"] = None) -> str:
+    """根据 BLE 地址返回设备别名，未设置则原样返回 MAC。"""
+    device = device or ""
+    if cfg is None:
+        return device
+    return (cfg.device_aliases or {}).get(device, device)
+
+
+def is_blocked_bundle(bundle_id: str, cfg: "BridgeConfig") -> bool:
+    return bundle_id in set(cfg.block_bundle or [])
+
+
+def _icons_cache_dir() -> Path:
+    appdata = Path(os.getenv("APPDATA", str(Path.home())))
+    d = appdata / "NekoLink" / "icons"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def resolve_app_icon(bundle_id: str, app_name: str, cfg: Optional["BridgeConfig"] = None) -> str:
+    """返回 Toast 用图标路径：优先用户配置，否则自动生成字母图标。"""
+    bundle_id = (bundle_id or "").strip()
+    app_name = (app_name or bundle_id or "?").strip()
+
+    if cfg is not None:
+        custom = (cfg.app_icon_map or {}).get(bundle_id, "").strip()
+        if custom and os.path.isfile(custom):
+            return os.path.abspath(custom)
+
+    if bundle_id:
+        safe = re.sub(r"[^\w.\-]+", "_", bundle_id)
+        cache = _icons_cache_dir() / f"{safe}.png"
+        if cache.is_file():
+            return str(cache)
+        generated = _generate_app_icon(app_name, cache)
+        if generated:
+            return generated
+
+    base = _base_dir()
+    for name in ("icon.ico", "icon.png"):
+        p = base / name
+        if p.is_file():
+            return str(p.resolve())
+    return ""
+
+
+def _generate_app_icon(app_name: str, out_path: Path) -> str:
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+
+        size = 128
+        letter = (app_name or "?")[0].upper()
+        seed = sum(ord(c) for c in app_name)
+        color = (
+            80 + seed % 120,
+            80 + (seed // 7) % 120,
+            80 + (seed // 13) % 120,
+        )
+        img = Image.new("RGBA", (size, size), color + (255,))
+        draw = ImageDraw.Draw(img)
+        try:
+            font = ImageFont.truetype("segoeui.ttf", 64)
+        except Exception:
+            font = ImageFont.load_default()
+        bbox = draw.textbbox((0, 0), letter, font=font)
+        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        draw.text(((size - tw) / 2, (size - th) / 2 - 4), letter, fill="white", font=font)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        img.save(out_path, "PNG")
+        return str(out_path)
+    except Exception:
+        return ""
+
+
+def _default_push_template() -> str:
+    return (
+        "设备：{device}\n"
+        "【{app}】\n"
+        "标题：{title}\n"
+        "内容：{msg}\n"
+        "时间：{date}\n"
+        "电量：{battery}"
+    )
+
+
+# 推送模板可用变量（SMS Forwarder 风格，可重复插入）
+PUSH_TEMPLATE_VARS: List[Tuple[str, str]] = [
+    ("device", "设备名（别名）"),
+    ("device_mac", "BLE 地址"),
+    ("app", "应用名（映射后）"),
+    ("app_id", "Bundle ID"),
+    ("title", "标题"),
+    ("msg", "内容"),
+    ("date", "通知时间（格式化）"),
+    ("date_raw", "通知时间（原始）"),
+    ("battery", "电量"),
+    ("codes", "验证码"),
+    ("receive_time", "接收时间"),
+]
+
+PUSH_TEMPLATE_PRESETS: Dict[str, str] = {
+    "default": _default_push_template(),
+    "simple": "【{app}】\n标题：{title}\n内容：{msg}",
+    "detail": (
+        "设备：{device}\n"
+        "地址：{device_mac}\n"
+        "应用：{app} ({app_id})\n"
+        "标题：{title}\n"
+        "内容：{msg}\n"
+        "时间：{date}\n"
+        "电量：{battery}\n"
+        "验证码：{codes}\n"
+        "接收：{receive_time}"
+    ),
+}
+
+
+def format_ancs_date(date_str: str) -> str:
+    """20260904T170513 -> 2026年9月4日17:05:13"""
+    s = (date_str or "").strip()
+    m = re.match(r"^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})$", s)
+    if not m:
+        return s
+    y, mo, d, h, mi, se = m.groups()
+    return f"{int(y)}年{int(mo)}月{int(d)}日{h}:{mi}:{se}"
+
+
+def build_template_context(payload: dict, cfg: Optional["BridgeConfig"] = None) -> Dict[str, str]:
+    device_raw = payload.get("device") or ""
+    app_id = payload.get("app") or ""
+    bat = payload.get("battery")
+    bat_text = f"{bat}%" if isinstance(bat, int) else ""
+    date_raw = payload.get("date") or ""
+    ts = payload.get("ts") or time.time()
+    return {
+        "device": get_device_display_name(device_raw, cfg),
+        "device_mac": device_raw,
+        "app": get_app_display_name(app_id, cfg),
+        "app_id": app_id,
+        "title": payload.get("title") or "",
+        "msg": payload.get("msg") or "",
+        "date": format_ancs_date(date_raw),
+        "date_raw": date_raw,
+        "battery": bat_text,
+        "codes": " ".join(payload.get("codes") or []),
+        "receive_time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts)),
+    }
+
+
+def render_push_template(template: str, payload: dict, cfg: Optional["BridgeConfig"] = None) -> str:
+    """按模板替换 {变量}，支持同一变量多次出现。"""
+    tpl = template if template is not None else _default_push_template()
+    if not tpl.strip():
+        tpl = _default_push_template()
+    ctx = build_template_context(payload, cfg)
+    out = tpl
+    for key, val in ctx.items():
+        out = out.replace("{" + key + "}", val)
+    return out
+
+
+def _build_webhook_content(app_name: str, title: str, msg: str) -> str:
+    return f"【{app_name}】\n标题：{title}\n内容：{msg}"
+
+
+def _is_valid_http_url(url: str) -> bool:
+    url = (url or "").strip()
+    return url.startswith("http://") or url.startswith("https://")
+
+
+def send_dingtalk(
+    webhook: str,
+    secret: str,
+    content_text: str,
+    log: Optional[Callable[[str], None]] = None,
+) -> None:
+    """钉钉机器人标准 text 消息；读取 GUI 配置的 webhook/secret，失败不抛出。"""
+    webhook = (webhook or "").strip()
+    if not _is_valid_http_url(webhook):
+        return
+    try:
+        send_dingtalk_text(webhook, secret or "", content_text)
+    except Exception as e:
+        msg = f"[DingTalk] failed: {e}"
+        if log:
+            log(msg)
+        else:
+            print(msg, flush=True)
+
+
+def send_ntfy(
+    url: str,
+    content_text: str,
+    title_text: str,
+    log: Optional[Callable[[str], None]] = None,
+) -> None:
+    """ntfy.sh POST；title 走 query 参数以支持中文；失败不抛出。"""
+    url = (url or "").strip()
+    if not _is_valid_http_url(url):
+        return
+    try:
+        sep = "&" if "?" in url else "?"
+        post_url = f"{url}{sep}title={urllib.parse.quote(title_text or 'NekoLink')}"
+        r = requests.post(
+            post_url,
+            data=content_text.encode("utf-8"),
+            headers={"Content-Type": "text/plain; charset=utf-8"},
+            timeout=10,
+        )
+        if r.status_code >= 400:
+            msg = f"[ntfy] HTTP {r.status_code}: {r.text}"
+            if log:
+                log(msg)
+            else:
+                print(msg, flush=True)
+    except Exception as e:
+        msg = f"[ntfy] failed: {e}"
+        if log:
+            log(msg)
+        else:
+            print(msg, flush=True)
+
+
+def _dispatch_webhooks(
+    cfg: "BridgeConfig",
+    content_text: str,
+    title_text: str,
+    log: Optional[Callable[[str], None]] = None,
+) -> None:
+    """按 GUI 开关并行发送 DingTalk / ntfy，单个失败不影响另一个。"""
+    tasks: Dict[str, Callable[[], None]] = {}
+    if cfg.enable_dingtalk:
+        tasks["dingtalk"] = lambda: send_dingtalk(
+            cfg.dingtalk_webhook, cfg.dingtalk_secret, content_text, log=log
+        )
+    if getattr(cfg, "enable_ntfy", False):
+        tasks["ntfy"] = lambda: send_ntfy(
+            getattr(cfg, "ntfy_url", ""), content_text, title_text, log=log
+        )
+    if not tasks:
+        return
+    with ThreadPoolExecutor(max_workers=len(tasks)) as pool:
+        futures = {pool.submit(fn): name for name, fn in tasks.items()}
+        for fut in as_completed(futures):
+            name = futures[fut]
+            try:
+                fut.result()
+            except Exception as e:
+                msg = f"[WEBHOOK:{name}] failed: {e}"
+                if log:
+                    log(msg)
+                else:
+                    print(msg, flush=True)
 
 
 # -----------------------------
@@ -92,7 +374,14 @@ def load_config(path: str) -> "BridgeConfig":
     try:
         with open(path, "r", encoding="utf-8") as f:
             d = json.load(f)
-        return BridgeConfig(**d)
+        # 兼容旧字段 privacy_hide_* → privacy_show_*
+        if "privacy_show_title" not in d and "privacy_hide_title" in d:
+            d["privacy_show_title"] = not bool(d.get("privacy_hide_title"))
+        if "privacy_show_msg" not in d and "privacy_hide_msg" in d:
+            d["privacy_show_msg"] = not bool(d.get("privacy_hide_msg"))
+        fields = {f.name for f in dataclasses.fields(BridgeConfig)}
+        filtered = {k: v for k, v in d.items() if k in fields}
+        return BridgeConfig(**filtered)
     except Exception:
         return BridgeConfig()
 
@@ -114,7 +403,13 @@ class BridgeConfig:
 
     # devices
     ble_addresses: List[str] = field(default_factory=list)
+    device_aliases: Dict[str, str] = field(default_factory=dict)
     auto_pick_heart_rate: bool = False
+
+    # app display / webhook filter
+    app_bundle_map: Dict[str, str] = field(default_factory=_default_app_bundle_map)
+    app_icon_map: Dict[str, str] = field(default_factory=dict)
+    block_bundle: List[str] = field(default_factory=lambda: ["com.alibaba.DingTalkTalk"])
 
     # telegram
     enable_telegram: bool = True
@@ -134,6 +429,10 @@ class BridgeConfig:
     enable_dingtalk: bool = False
     dingtalk_webhook: str = ""
     dingtalk_secret: str = ""
+
+    # ntfy
+    enable_ntfy: bool = False
+    ntfy_url: str = ""
 
     # gotify
     enable_gotify: bool = False
@@ -163,6 +462,14 @@ class BridgeConfig:
     # misc
     show_battery_in_message: bool = True
     enable_windows_toast: bool = True
+    popup_position: str = "bottom_right"
+    notification_width: int = 420
+    notification_font_size: int = 8
+    privacy_show_title: bool = True
+    privacy_show_msg: bool = True
+
+    # push template (DingTalk / ntfy)
+    push_template: str = field(default_factory=_default_push_template)
 
 
 # -----------------------------
@@ -509,10 +816,12 @@ class BridgeManager:
         cfg: BridgeConfig,
         log_func: Callable[[str], None],
         on_notification: Callable[[dict], None],
+        on_desktop_popup: Optional[Callable[..., None]] = None,
     ):
         self.cfg = cfg
         self.log = log_func
         self.on_notification = on_notification
+        self.on_desktop_popup = on_desktop_popup
 
         self._threads: Dict[str, threading.Thread] = {}
         self._loops: Dict[str, asyncio.AbstractEventLoop] = {}
@@ -612,23 +921,68 @@ class BridgeManager:
         if not self._dedup_ok(payload):
             return
 
+        if not payload.get("notif_id"):
+            payload["notif_id"] = f"nk-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
+
         try:
             self._forward(payload)
         except Exception as e:
             self.log(f"[FORWARD] error: {e}")
 
         try:
+            self._forward_webhooks(payload)
+        except Exception as e:
+            self.log(f"[WEBHOOK] error: {e}")
+
+        try:
             self.on_notification(payload)
         except Exception:
             pass
+
+    def _forward_webhooks(self, payload: dict) -> None:
+        """精简模板转发至 GUI 中启用的 DingTalk / ntfy；block_bundle 内应用跳过。"""
+        app_id = payload.get("app") or ""
+        if is_blocked_bundle(app_id, self.cfg):
+            return
+
+        app_name = get_app_display_name(app_id, self.cfg)
+        template = getattr(self.cfg, "push_template", "") or _default_push_template()
+        content_text = render_push_template(template, payload, self.cfg)
+        _dispatch_webhooks(self.cfg, content_text, app_name, log=self.log)
 
     def _forward(self, payload: dict):
         cfg = self.cfg
         text = _format_message(payload, cfg)
 
-        if cfg.enable_windows_toast and show_toast is not None:
+        if cfg.enable_windows_toast:
             try:
-                show_toast("NekoLink", text)
+                app_id = payload.get("app") or ""
+                app_name = get_app_display_name(app_id, cfg)
+                notif_title = payload.get("title") or ""
+                notif_msg = payload.get("msg") or ""
+                icon_path = resolve_app_icon(app_id, app_name, cfg)
+                notif_id = payload.get("notif_id") or ""
+                template = getattr(cfg, "push_template", "") or _default_push_template()
+                body_text = render_push_template(template, payload, cfg)
+                if self.on_desktop_popup is not None:
+                    self.on_desktop_popup(
+                        app_name,
+                        notif_title,
+                        notif_msg,
+                        icon_path=icon_path,
+                        notif_id=notif_id,
+                        body_text=body_text,
+                    )
+                elif show_notification_toast is not None:
+                    show_notification_toast(
+                        app_name,
+                        notif_title,
+                        notif_msg,
+                        icon_path=icon_path,
+                        log=self.log,
+                    )
+                elif show_toast is not None:
+                    show_toast(app_name, _build_webhook_content(app_name, notif_title, notif_msg), log=self.log)
             except Exception as e:
                 self.log(f"[TOAST] failed: {e}")
 
@@ -637,12 +991,6 @@ class BridgeManager:
                 send_telegram(cfg.telegram_bot_token, cfg.telegram_chat_id, text)
             except Exception as e:
                 self.log(f"[TG] failed: {e}")
-
-        if cfg.enable_dingtalk:
-            try:
-                send_dingtalk_text(cfg.dingtalk_webhook, cfg.dingtalk_secret, text)
-            except Exception as e:
-                self.log(f"[DT] failed: {e}")
 
         if cfg.enable_gotify:
             try:
@@ -690,3 +1038,44 @@ class BridgeManager:
                         send_email(cfg, "NekoLink Code", code_text)
                     except Exception as e:
                         self.log(f"[MAIL-code] failed: {e}")
+
+
+# -----------------------------
+# Standalone CLI entry
+# -----------------------------
+if __name__ == "__main__":
+    def _cli_log(msg: str) -> None:
+        print(msg, flush=True)
+
+    def _cli_on_notification(payload: dict) -> None:
+        device = payload.get("device") or ""
+        device_name = get_device_display_name(device, _cfg)
+        app_id = payload.get("app") or ""
+        app_name = get_app_display_name(app_id, _cfg)
+        bat = payload.get("battery")
+        bat_text = f"{bat}%" if isinstance(bat, int) else "--"
+        _cli_log(
+            f"[通知] 设备={device_name} | 电量={bat_text} | 应用={app_name}\n"
+            f"  标题: {payload.get('title') or ''}\n"
+            f"  内容: {payload.get('msg') or ''}"
+        )
+
+    _cfg_path = get_config_path()
+    _cfg = load_config(_cfg_path)
+    _cli_log(f"NekoLink ANCS Bridge (config: {_cfg_path})")
+
+    _addrs = list(_cfg.ble_addresses or [])
+    if not _addrs:
+        _cli_log("错误: 请在 config.json 的 ble_addresses 中填入 iPhone 的 BLE 地址")
+        raise SystemExit(1)
+
+    _manager = BridgeManager(_cfg, _cli_log, _cli_on_notification)
+    _manager.start_all(_addrs)
+    _cli_log(f"已启动监听: {', '.join(_addrs)}（Ctrl+C 退出）")
+
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        _cli_log("正在停止...")
+        _manager.stop_all()

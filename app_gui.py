@@ -4,7 +4,8 @@ import queue
 import threading
 import time
 import tkinter as tk
-from tkinter import messagebox
+from tkinter import messagebox, filedialog
+from typing import Optional
 from ttkbootstrap.scrolled import ScrolledFrame
 import ttkbootstrap as tb
 from ttkbootstrap.constants import *
@@ -13,15 +14,31 @@ import i18n
 from ancs_bridge import (
     BridgeConfig,
     BridgeManager,
+    PUSH_TEMPLATE_PRESETS,
+    PUSH_TEMPLATE_VARS,
+    format_ancs_date,
+    get_app_display_name,
+    get_device_display_name,
     get_config_path,
     load_config,
+    render_push_template,
     save_config,
     send_dingtalk_text,
     send_email,
     send_telegram,
     send_gotify,
+    send_ntfy,
 )
 from tray_helper import TrayController
+from popup_toast import (
+    NotificationManager,
+    normalize_popup_position,
+    POPUP_POSITION_LABELS,
+    normalize_notification_width,
+    normalize_notification_font_size,
+    NOTIFICATION_WIDTH_LABELS,
+    NOTIFICATION_FONT_LABELS,
+)
 
 CONFIG_PATH = get_config_path()
 ICON_PATH = "icon.ico"
@@ -41,9 +58,27 @@ class App(tb.Window):
         self.geometry("1100x720")
         self.minsize(980, 620)
 
-        self.manager = BridgeManager(self.cfg, self.log, self.on_notification)
         self.running = False
         self.history = []  # list of payload dict
+        self._hist_raw: dict = {}  # tree iid -> {"app": bundle_id, "device": mac, "notif_id": ...}
+        self._notif_to_iid: dict = {}
+        self._map_icon_paths: dict = {}
+
+        self.popup_toast = NotificationManager(
+            self,
+            on_click=self.open_history_for_notif,
+            popup_position=getattr(self.cfg, "popup_position", "bottom_right"),
+            notification_width=getattr(self.cfg, "notification_width", 420),
+            notification_font_size=getattr(self.cfg, "notification_font_size", 8),
+            privacy_show_title=getattr(self.cfg, "privacy_show_title", True),
+            privacy_show_msg=getattr(self.cfg, "privacy_show_msg", True),
+        )
+        self.manager = BridgeManager(
+            self.cfg,
+            self.log,
+            self.on_notification,
+            on_desktop_popup=self._show_desktop_popup,
+        )
 
         icon_path = ICON_PATH if os.path.exists(ICON_PATH) else None
         self.tray = TrayController(
@@ -169,6 +204,16 @@ class App(tb.Window):
         self.ui["chk_code_sep"].config(text=i18n.t("send_code_sep"))
         self.ui["lbl_history_limit"].config(text=i18n.t("history_limit"))
         self.ui["lbl_preview"].config(text=i18n.t("latest_preview"))
+        self.ui["lbl_push_preview"].config(text=i18n.t("push_preview"))
+        self.ui["lbl_push_tpl"].config(text=i18n.t("push_template"))
+        self.ui["lbl_tpl_preset"].config(text=i18n.t("tpl_preset"))
+        self.ui["lbl_tpl_var"].config(text=i18n.t("tpl_var"))
+        self.ui["btn_tpl_insert"].config(text=i18n.t("tpl_insert"))
+        self.ui["lbl_tpl_hint"].config(text=i18n.t("tpl_hint"))
+        preset_labels = [i18n.t("tpl_preset_default"), i18n.t("tpl_preset_simple"), i18n.t("tpl_preset_detail")]
+        self.cmb_tpl_preset.config(values=preset_labels)
+        if not self.var_tpl_preset.get():
+            self.cmb_tpl_preset.set(preset_labels[0])
         self.ui["lbl_tip_tray"].config(text=i18n.t("tip_tray"))
 
         # devices
@@ -178,6 +223,32 @@ class App(tb.Window):
         self.ui["btn_remove_addr"].config(text=i18n.t("remove_selected"))
         self.ui["txt_scan_hint"].config(text=i18n.t("scan_hint"))
         self.ui["btn_save_devices"].config(text=i18n.t("save"))
+        self.ui["lbl_device_alias"].config(text=i18n.t("device_alias"))
+        self.ui["btn_set_device_alias"].config(text=i18n.t("set_alias"))
+        if "dev_tree" in self.ui:
+            self.ui["dev_tree"].heading("addr", text=i18n.t("col_ble_addr"))
+            self.ui["dev_tree"].heading("alias", text=i18n.t("col_alias"))
+
+        # history / app map
+        self.ui["lbl_app_map"].config(text=i18n.t("app_map_title"))
+        self.ui["lbl_map_hint"].config(text=i18n.t("app_map_hint"))
+        self.ui["lbl_map_bundle"].config(text=i18n.t("col_bundle_id"))
+        self.ui["lbl_map_name"].config(text=i18n.t("col_app_name"))
+        self.ui["btn_map_upsert"].config(text=i18n.t("map_upsert"))
+        self.ui["btn_map_remove"].config(text=i18n.t("remove_selected"))
+        self.ui["btn_save_history"].config(text=i18n.t("save"))
+        if "map_tree" in self.ui:
+            self.ui["map_tree"].heading("bundle", text=i18n.t("col_bundle_id"))
+            self.ui["map_tree"].heading("name", text=i18n.t("col_app_name"))
+            self.ui["map_tree"].heading("block", text=i18n.t("col_skip_webhook"))
+            self.ui["map_tree"].heading("icon", text=i18n.t("col_icon"))
+        if hasattr(self, "ui") and "lbl_map_icon" in self.ui:
+            self.ui["lbl_map_icon"].config(text=i18n.t("col_icon"))
+            self.ui["btn_map_icon"].config(text=i18n.t("browse_icon"))
+            self.ui["lbl_map_icon_hint"].config(text=i18n.t("map_icon_hint"))
+        if "tree" in self.ui:
+            self.ui["tree"].heading("device", text=i18n.t("col_alias"))
+            self.ui["tree"].heading("app", text=i18n.t("col_app_name"))
 
         # filter
         self.ui["lbl_block_intro"].config(text=i18n.t("block_intro"))
@@ -190,6 +261,36 @@ class App(tb.Window):
         self.ui["lbl_misc_title"].config(text=i18n.t("misc_title"))
         self.ui["chk_battery"].config(text=i18n.t("misc_battery"))
         self.ui["chk_toast"].config(text=i18n.t("misc_toast"))
+        self.ui["lbl_toast_hint"].config(text=i18n.t("misc_toast_hint"))
+        self.ui["btn_test_toast"].config(text=i18n.t("misc_toast_test"))
+        self.ui["lbl_popup_position"].config(text=i18n.t("misc_popup_position"))
+        if hasattr(self, "cmb_popup_pos"):
+            cur = self._popup_pos_key_from_label(self.var_popup_pos.get())
+            self.cmb_popup_pos.configure(values=[self._popup_pos_label_from_key(k) for k in self._popup_pos_keys])
+            self.var_popup_pos.set(self._popup_pos_label_from_key(cur))
+        self.ui["lbl_notif_font"].config(text=i18n.t("misc_notif_font"))
+        if hasattr(self, "cmb_notif_font"):
+            cur_font = self._notif_font_key_from_label(self.var_notif_font.get())
+            font_values = list(dict.fromkeys(
+                [self._notif_font_label_from_key(k) for k in self._notif_font_keys]
+            ))
+            self.cmb_notif_font.configure(values=font_values)
+            self.var_notif_font.set(self._notif_font_label_from_key(cur_font))
+        self.ui["lbl_notif_width"].config(text=i18n.t("misc_notif_width"))
+        if hasattr(self, "cmb_notif_width"):
+            cur_width = self._notif_width_key_from_label(self.var_notif_width.get())
+            width_values = list(dict.fromkeys(
+                [self._notif_width_label_from_key(k) for k in self._notif_width_keys]
+            ))
+            self.cmb_notif_width.configure(values=width_values)
+            self.var_notif_width.set(self._notif_width_label_from_key(cur_width))
+        if hasattr(self, "privacy_frm"):
+            self.privacy_frm.configure(text=i18n.t("privacy_title"))
+        if "chk_privacy_show_title" in self.ui:
+            self.ui["chk_privacy_show_title"].config(text=i18n.t("privacy_show_title"))
+            self.ui["lbl_privacy_show_title_hint"].config(text=i18n.t("privacy_show_title_hint"))
+            self.ui["chk_privacy_show_msg"].config(text=i18n.t("privacy_show_msg"))
+            self.ui["lbl_privacy_show_msg_hint"].config(text=i18n.t("privacy_show_msg_hint"))
         self.ui["btn_save_misc"].config(text=i18n.t("save"))
 
         # history/logs
@@ -243,18 +344,67 @@ class App(tb.Window):
         self.ui["lbl_history_limit"].pack(anchor=W, pady=(10, 0))
         tb.Entry(left, textvariable=self.var_history_limit, width=10).pack(anchor=W)
 
+        tb.Separator(left).pack(fill=X, pady=10)
+
+        self.ui["lbl_push_tpl"] = tb.Label(left, text="推送模板", font=("Segoe UI", 11, "bold"))
+        self.ui["lbl_push_tpl"].pack(anchor=W, pady=(0, 6))
+
+        preset_row = tb.Frame(left)
+        preset_row.pack(fill=X, pady=(0, 6))
+        self.ui["lbl_tpl_preset"] = tb.Label(preset_row, text="预设")
+        self.ui["lbl_tpl_preset"].pack(side=LEFT, padx=(0, 8))
+        self.var_tpl_preset = tk.StringVar()
+        self.cmb_tpl_preset = tb.Combobox(
+            preset_row,
+            textvariable=self.var_tpl_preset,
+            state="readonly",
+            width=18,
+        )
+        self.cmb_tpl_preset.pack(side=LEFT, fill=X, expand=True)
+        self.cmb_tpl_preset.bind("<<ComboboxSelected>>", self._on_tpl_preset_change)
+
+        self.txt_push_template = tk.Text(left, height=7, wrap="word", width=42)
+        self.txt_push_template.pack(fill=X, pady=(0, 6))
+        tpl_text = getattr(self.cfg, "push_template", "") or PUSH_TEMPLATE_PRESETS["default"]
+        self.txt_push_template.insert("1.0", tpl_text)
+
+        var_row = tb.Frame(left)
+        var_row.pack(fill=X, pady=(0, 6))
+        self.ui["lbl_tpl_var"] = tb.Label(var_row, text="插入变量")
+        self.ui["lbl_tpl_var"].pack(side=LEFT, padx=(0, 8))
+        self.var_tpl_insert = tk.StringVar()
+        var_keys = [f"{{{k}}}" for k, _ in PUSH_TEMPLATE_VARS]
+        self.cmb_tpl_var = tb.Combobox(var_row, textvariable=self.var_tpl_insert, values=var_keys, width=18)
+        self.cmb_tpl_var.pack(side=LEFT, padx=(0, 8))
+        if var_keys:
+            self.cmb_tpl_var.set(var_keys[0])
+        self.ui["btn_tpl_insert"] = tb.Button(var_row, text="插入", bootstyle="secondary", command=self.insert_template_var)
+        self.ui["btn_tpl_insert"].pack(side=LEFT)
+
+        hint = "  ".join(f"{{{k}}}" for k, _ in PUSH_TEMPLATE_VARS)
+        self.ui["lbl_tpl_hint"] = tb.Label(left, text=hint, bootstyle="secondary", wraplength=380, justify=LEFT)
+        self.ui["lbl_tpl_hint"].pack(anchor=W)
+
         right = tb.Frame(frm)
         right.pack(side=LEFT, fill=BOTH, expand=True)
 
         self.ui["lbl_preview"] = tb.Label(right, text="", font=("Segoe UI", 12, "bold"))
         self.ui["lbl_preview"].pack(anchor=W)
 
-        self.preview = tk.Text(right, height=9, wrap="word")
+        self.preview = tk.Text(right, height=8, wrap="word")
         self.preview.pack(fill=X, pady=(8, 8))
         self.preview.insert("end", "（暂无）\n")
 
+        self.ui["lbl_push_preview"] = tb.Label(right, text="推送预览", font=("Segoe UI", 12, "bold"))
+        self.ui["lbl_push_preview"].pack(anchor=W)
+
+        self.push_preview = tk.Text(right, height=8, wrap="word")
+        self.push_preview.pack(fill=X, pady=(8, 8))
+        self.push_preview.insert("end", "（暂无）\n")
+
         self.ui["lbl_tip_tray"] = tb.Label(right, text="")
         self.ui["lbl_tip_tray"].pack(anchor=W)
+        self._last_payload: Optional[dict] = None
 
     def _build_devices(self):
         frm = tb.Frame(self.tab_devices, padding=12)
@@ -269,10 +419,26 @@ class App(tb.Window):
         self.ui["btn_scan"] = tb.Button(top, text="", bootstyle="info", command=self.scan_devices)
         self.ui["btn_scan"].pack(side=RIGHT)
 
-        self.lst_addr = tk.Listbox(frm, height=10)
-        self.lst_addr.pack(fill=X, pady=(0, 10))
-        for a in (self.cfg.ble_addresses or []):
-            self.lst_addr.insert("end", a)
+        self.dev_tree = tb.Treeview(frm, columns=("addr", "alias"), show="headings", height=8, selectmode="browse")
+        self.dev_tree.heading("addr", text="BLE 地址")
+        self.dev_tree.heading("alias", text="别名")
+        self.dev_tree.column("addr", width=220, anchor=W)
+        self.dev_tree.column("alias", width=220, anchor=W)
+        self.dev_tree.pack(fill=X, pady=(0, 10))
+        self.ui["dev_tree"] = self.dev_tree
+        self._reload_device_tree()
+
+        alias_row = tb.Frame(frm)
+        alias_row.pack(fill=X, pady=(0, 10))
+        self.ui["lbl_device_alias"] = tb.Label(alias_row, text="设备别名")
+        self.ui["lbl_device_alias"].pack(side=LEFT, padx=(0, 8))
+        self.var_device_alias = tk.StringVar()
+        tb.Entry(alias_row, textvariable=self.var_device_alias, width=32).pack(side=LEFT, padx=(0, 8))
+        self.ui["btn_set_device_alias"] = tb.Button(
+            alias_row, text="设置别名", bootstyle="secondary", command=self.set_device_alias
+        )
+        self.ui["btn_set_device_alias"].pack(side=LEFT)
+        self.dev_tree.bind("<<TreeviewSelect>>", self._on_device_select)
 
         ctl = tb.Frame(frm)
         ctl.pack(fill=X)
@@ -289,7 +455,7 @@ class App(tb.Window):
         self.ui["txt_scan_hint"] = tb.Label(frm, text="", bootstyle="secondary")
         self.ui["txt_scan_hint"].pack(anchor=W, pady=(0, 6))
 
-        self.scan_box = tk.Text(frm, height=10, wrap="word")
+        self.scan_box = tk.Text(frm, height=8, wrap="word")
         self.scan_box.pack(fill=BOTH, expand=True)
         self.scan_box.insert("end", "")
 
@@ -306,6 +472,40 @@ class App(tb.Window):
 
         self.ui["btn_save_devices"] = tb.Button(frm, text="", bootstyle="primary", command=self.on_save)
         self.ui["btn_save_devices"].pack(anchor=SE, pady=(10, 0))
+
+    def _reload_device_tree(self):
+        self.dev_tree.delete(*self.dev_tree.get_children())
+        aliases = getattr(self.cfg, "device_aliases", {}) or {}
+        for addr in (self.cfg.ble_addresses or []):
+            self.dev_tree.insert("", "end", values=(addr, aliases.get(addr, "")))
+
+    def _on_device_select(self, _evt=None):
+        sel = self.dev_tree.selection()
+        if not sel:
+            return
+        vals = self.dev_tree.item(sel[0], "values")
+        if len(vals) >= 2:
+            self.var_device_alias.set(vals[1])
+
+    def set_device_alias(self):
+        sel = self.dev_tree.selection()
+        if not sel:
+            messagebox.showwarning(i18n.t("missing"), i18n.t("select_device_first"))
+            return
+        alias = self.var_device_alias.get().strip()
+        vals = list(self.dev_tree.item(sel[0], "values"))
+        if len(vals) < 1:
+            return
+        addr = vals[0]
+        self.dev_tree.item(sel[0], values=(addr, alias))
+        if not hasattr(self.cfg, "device_aliases") or self.cfg.device_aliases is None:
+            self.cfg.device_aliases = {}
+        if alias:
+            self.cfg.device_aliases[addr] = alias
+        else:
+            self.cfg.device_aliases.pop(addr, None)
+        self._persist_config(show_msg=False)
+        self.log(f"[UI] 设备别名已保存: {addr} -> {alias or '(空)'}")
 
     # ✅ Destinations: scrollable + fixed bottom Save
     def _build_dest(self):
@@ -376,6 +576,22 @@ class App(tb.Window):
         )
         tb.Button(dt, text="Test", bootstyle="success", command=self.test_dingtalk).grid(
             row=3, column=1, sticky=W, pady=(8, 0)
+        )
+
+        # ntfy
+        nf = tb.Labelframe(frm, text="ntfy.sh", padding=10)
+        nf.pack(fill=X, pady=(0, 12))
+
+        self.var_ntfy_on = tk.BooleanVar(value=getattr(self.cfg, "enable_ntfy", False))
+        self.var_ntfy_url = tk.StringVar(value=getattr(self.cfg, "ntfy_url", ""))
+
+        tb.Checkbutton(nf, text="Enable ntfy", variable=self.var_ntfy_on, bootstyle="round-toggle").grid(
+            row=0, column=0, sticky=W, pady=(0, 6)
+        )
+        tb.Label(nf, text="Topic URL").grid(row=1, column=0, sticky=W)
+        tb.Entry(nf, textvariable=self.var_ntfy_url, width=78).grid(row=1, column=1, sticky=W, pady=2)
+        tb.Button(nf, text="Test", bootstyle="success", command=self.test_ntfy).grid(
+            row=2, column=1, sticky=W, pady=(8, 0)
         )
 
         # Gotify
@@ -494,22 +710,146 @@ class App(tb.Window):
         self.ui["btn_save_filter"].pack(anchor=SE, pady=(10, 0))
 
     def _build_misc(self):
-        frm = tb.Frame(self.tab_misc, padding=12)
+        frm = tb.Frame(self.tab_misc, padding=10)
         frm.pack(fill=BOTH, expand=True)
 
         self.ui["lbl_misc_title"] = tb.Label(frm, text="", font=("Segoe UI", 12, "bold"))
-        self.ui["lbl_misc_title"].pack(anchor=W, pady=(0, 10))
+        self.ui["lbl_misc_title"].pack(anchor=W, pady=(0, 4))
 
         self.var_show_battery = tk.BooleanVar(value=getattr(self.cfg, "show_battery_in_message", True))
         self.var_win_toast = tk.BooleanVar(value=getattr(self.cfg, "enable_windows_toast", True))
 
         self.ui["chk_battery"] = tb.Checkbutton(frm, text="", variable=self.var_show_battery, bootstyle="round-toggle")
-        self.ui["chk_battery"].pack(anchor=W, pady=(0, 10))
-        self.ui["chk_toast"] = tb.Checkbutton(frm, text="", variable=self.var_win_toast, bootstyle="round-toggle")
-        self.ui["chk_toast"].pack(anchor=W, pady=(0, 10))
+        self.ui["chk_battery"].pack(anchor=W, pady=(0, 3))
+
+        toast_row = tb.Frame(frm)
+        toast_row.pack(fill=X, anchor=W, pady=(0, 2))
+        self.ui["chk_toast"] = tb.Checkbutton(toast_row, text="", variable=self.var_win_toast, bootstyle="round-toggle")
+        self.ui["chk_toast"].pack(side=LEFT)
+        self.ui["btn_test_toast"] = tb.Button(toast_row, text="测试弹窗", bootstyle="info", command=self.test_desktop_toast)
+        self.ui["btn_test_toast"].pack(side=LEFT, padx=(12, 0))
+
+        self.ui["lbl_toast_hint"] = tb.Label(frm, text="", bootstyle="secondary", wraplength=520, justify=LEFT)
+        self.ui["lbl_toast_hint"].pack(anchor=W, pady=(0, 4))
+
+        pos_row = tb.Frame(frm)
+        pos_row.pack(fill=X, anchor=W, pady=(0, 3))
+        self._popup_pos_keys = ["bottom_right", "top_right", "bottom_left", "top_left"]
+        self.ui["lbl_popup_position"] = tb.Label(pos_row, text="弹窗位置")
+        self.ui["lbl_popup_position"].pack(side=LEFT, padx=(0, 8))
+        self.var_popup_pos = tk.StringVar(
+            value=self._popup_pos_label_from_key(getattr(self.cfg, "popup_position", "bottom_right"))
+        )
+        self.cmb_popup_pos = tb.Combobox(
+            pos_row,
+            textvariable=self.var_popup_pos,
+            values=[self._popup_pos_label_from_key(k) for k in self._popup_pos_keys],
+            state="readonly",
+            width=14,
+        )
+        self.cmb_popup_pos.pack(side=LEFT)
+
+        font_row = tb.Frame(frm)
+        font_row.pack(fill=X, anchor=W, pady=(0, 3))
+        self._notif_font_keys = [6, 8, 10, 12]
+        self.ui["lbl_notif_font"] = tb.Label(font_row, text="通知字体大小")
+        self.ui["lbl_notif_font"].pack(side=LEFT, padx=(0, 8))
+        self.var_notif_font = tk.StringVar(
+            value=self._notif_font_label_from_key(getattr(self.cfg, "notification_font_size", 8))
+        )
+        font_values = [self._notif_font_label_from_key(k) for k in self._notif_font_keys]
+        # 去重，防止下拉出现重复「默认」项
+        font_values = list(dict.fromkeys(font_values))
+        self.cmb_notif_font = tb.Combobox(
+            font_row,
+            textvariable=self.var_notif_font,
+            values=font_values,
+            state="readonly",
+            width=14,
+        )
+        self.cmb_notif_font.pack(side=LEFT)
+
+        width_row = tb.Frame(frm)
+        width_row.pack(fill=X, anchor=W, pady=(0, 3))
+        self._notif_width_keys = [300, 420, 480, 540]
+        self.ui["lbl_notif_width"] = tb.Label(width_row, text="通知弹窗宽度")
+        self.ui["lbl_notif_width"].pack(side=LEFT, padx=(0, 8))
+        self.var_notif_width = tk.StringVar(
+            value=self._notif_width_label_from_key(getattr(self.cfg, "notification_width", 420))
+        )
+        width_values = [self._notif_width_label_from_key(k) for k in self._notif_width_keys]
+        width_values = list(dict.fromkeys(width_values))
+        self.cmb_notif_width = tb.Combobox(
+            width_row,
+            textvariable=self.var_notif_width,
+            values=width_values,
+            state="readonly",
+            width=14,
+        )
+        self.cmb_notif_width.pack(side=LEFT)
+
+        def _sync_popup_ui_settings(_evt=None):
+            self.popup_toast.apply_ui_settings(
+                popup_position=self._popup_pos_key_from_label(self.var_popup_pos.get()),
+                notification_font_size=self._notif_font_key_from_label(self.var_notif_font.get()),
+                notification_width=self._notif_width_key_from_label(self.var_notif_width.get()),
+                privacy_show_title=bool(self.var_privacy_show_title.get()),
+                privacy_show_msg=bool(self.var_privacy_show_msg.get()),
+            )
+            if self.running and self.manager:
+                self.manager.cfg.popup_position = self._popup_pos_key_from_label(self.var_popup_pos.get())
+                self.manager.cfg.notification_font_size = self._notif_font_key_from_label(
+                    self.var_notif_font.get()
+                )
+                self.manager.cfg.notification_width = self._notif_width_key_from_label(
+                    self.var_notif_width.get()
+                )
+                self.manager.cfg.privacy_show_title = bool(self.var_privacy_show_title.get())
+                self.manager.cfg.privacy_show_msg = bool(self.var_privacy_show_msg.get())
+
+        self.cmb_popup_pos.bind("<<ComboboxSelected>>", _sync_popup_ui_settings)
+        self.cmb_notif_font.bind("<<ComboboxSelected>>", _sync_popup_ui_settings)
+        self.cmb_notif_width.bind("<<ComboboxSelected>>", _sync_popup_ui_settings)
+
+        self.privacy_frm = tb.Labelframe(frm, text="隐私设置", padding=6)
+        self.privacy_frm.pack(fill=X, anchor=W, pady=(4, 4))
+
+        self.var_privacy_show_title = tk.BooleanVar(value=getattr(self.cfg, "privacy_show_title", True))
+        self.ui["chk_privacy_show_title"] = tb.Checkbutton(
+            self.privacy_frm,
+            text="显示通知标题（发件人/会话标题）",
+            variable=self.var_privacy_show_title,
+            bootstyle="round-toggle",
+            command=_sync_popup_ui_settings,
+        )
+        self.ui["chk_privacy_show_title"].pack(anchor=W, pady=(0, 1))
+        self.ui["lbl_privacy_show_title_hint"] = tb.Label(
+            self.privacy_frm, text="", bootstyle="secondary", wraplength=520, justify=LEFT
+        )
+        self.ui["lbl_privacy_show_title_hint"].pack(anchor=W, pady=(0, 3))
+
+        self.var_privacy_show_msg = tk.BooleanVar(value=getattr(self.cfg, "privacy_show_msg", True))
+        self.ui["chk_privacy_show_msg"] = tb.Checkbutton(
+            self.privacy_frm,
+            text="显示通知消息内容（消息正文）",
+            variable=self.var_privacy_show_msg,
+            bootstyle="round-toggle",
+            command=_sync_popup_ui_settings,
+        )
+        self.ui["chk_privacy_show_msg"].pack(anchor=W, pady=(0, 1))
+        self.ui["lbl_privacy_show_msg_hint"] = tb.Label(
+            self.privacy_frm, text="", bootstyle="secondary", wraplength=520, justify=LEFT
+        )
+        self.ui["lbl_privacy_show_msg_hint"].pack(anchor=W)
+
+        def _on_toast_toggle():
+            if self.running and self.manager:
+                self.manager.cfg.enable_windows_toast = bool(self.var_win_toast.get())
+
+        self.var_win_toast.trace_add("write", lambda *_: _on_toast_toggle())
 
         self.ui["btn_save_misc"] = tb.Button(frm, text="", bootstyle="primary", command=self.on_save)
-        self.ui["btn_save_misc"].pack(anchor=SE, pady=(10, 0))
+        self.ui["btn_save_misc"].pack(anchor=SE, pady=(6, 0))
 
     def _build_history(self):
         frm = tb.Frame(self.tab_history, padding=12)
@@ -527,17 +867,167 @@ class App(tb.Window):
         self.ui["btn_copy_history"].pack(side=RIGHT)
 
         cols = ("time", "device", "battery", "app", "title", "msg", "codes")
-        self.tree = tb.Treeview(frm, columns=cols, show="headings", height=18)
+        self.tree = tb.Treeview(frm, columns=cols, show="headings", height=10)
+        self.ui["tree"] = self.tree
         for c in cols:
             self.tree.heading(c, text=c)
         self.tree.column("time", width=150, anchor=W)
-        self.tree.column("device", width=150, anchor=W)
-        self.tree.column("battery", width=80, anchor=W)
-        self.tree.column("app", width=220, anchor=W)
+        self.tree.column("device", width=120, anchor=W)
+        self.tree.column("battery", width=70, anchor=W)
+        self.tree.column("app", width=120, anchor=W)
         self.tree.column("title", width=220, anchor=W)
-        self.tree.column("msg", width=320, anchor=W)
-        self.tree.column("codes", width=140, anchor=W)
-        self.tree.pack(fill=BOTH, expand=True)
+        self.tree.column("msg", width=280, anchor=W)
+        self.tree.column("codes", width=120, anchor=W)
+        self.tree.pack(fill=BOTH, expand=True, pady=(0, 10))
+        self.tree.bind("<Double-1>", self._on_history_dblclick)
+
+        map_frm = tb.Labelframe(frm, text="应用名称映射", padding=10)
+        map_frm.pack(fill=X)
+
+        self.ui["lbl_app_map"] = tb.Label(map_frm, text="应用名称映射", font=("Segoe UI", 11, "bold"))
+        self.ui["lbl_app_map"].pack(anchor=W)
+        self.ui["lbl_map_hint"] = tb.Label(
+            map_frm,
+            text="双击上方历史记录可快速填入 Bundle ID。保存后写入 config.json。",
+            bootstyle="secondary",
+        )
+        self.ui["lbl_map_hint"].pack(anchor=W, pady=(0, 8))
+
+        self.map_tree = tb.Treeview(
+            map_frm, columns=("bundle", "name", "block", "icon"), show="headings", height=5, selectmode="browse"
+        )
+        self.ui["map_tree"] = self.map_tree
+        self.map_tree.heading("bundle", text="Bundle ID")
+        self.map_tree.heading("name", text="显示名称")
+        self.map_tree.heading("block", text="跳过 webhook")
+        self.map_tree.heading("icon", text="图标")
+        self.map_tree.column("bundle", width=220, anchor=W)
+        self.map_tree.column("name", width=120, anchor=W)
+        self.map_tree.column("block", width=90, anchor=W)
+        self.map_tree.column("icon", width=100, anchor=W)
+        self.map_tree.pack(fill=X, pady=(0, 8))
+        self.map_tree.bind("<<TreeviewSelect>>", self._on_map_select)
+        self._reload_app_map_tree()
+
+        edit = tb.Frame(map_frm)
+        edit.pack(fill=X, pady=(0, 8))
+
+        self.ui["lbl_map_bundle"] = tb.Label(edit, text="Bundle ID")
+        self.ui["lbl_map_bundle"].grid(row=0, column=0, sticky=W, padx=(0, 8))
+        self.var_map_bundle = tk.StringVar()
+        tb.Entry(edit, textvariable=self.var_map_bundle, width=42).grid(row=0, column=1, sticky=W, padx=(0, 16))
+
+        self.ui["lbl_map_name"] = tb.Label(edit, text="显示名称")
+        self.ui["lbl_map_name"].grid(row=0, column=2, sticky=W, padx=(0, 8))
+        self.var_map_name = tk.StringVar()
+        tb.Entry(edit, textvariable=self.var_map_name, width=20).grid(row=0, column=3, sticky=W)
+
+        self.var_map_block = tk.BooleanVar(value=False)
+        tb.Checkbutton(
+            edit, text="跳过 webhook（防循环）", variable=self.var_map_block, bootstyle="round-toggle"
+        ).grid(row=1, column=1, sticky=W, pady=(8, 0))
+
+        icon_row = tb.Frame(map_frm)
+        icon_row.pack(fill=X, pady=(0, 8))
+        self.ui["lbl_map_icon"] = tb.Label(icon_row, text="应用图标")
+        self.ui["lbl_map_icon"].pack(side=LEFT, padx=(0, 8))
+        self.var_map_icon = tk.StringVar()
+        tb.Entry(icon_row, textvariable=self.var_map_icon, width=52).pack(side=LEFT, padx=(0, 8))
+        self.ui["btn_map_icon"] = tb.Button(icon_row, text="浏览...", bootstyle="secondary", command=self.browse_app_icon)
+        self.ui["btn_map_icon"].pack(side=LEFT)
+        self.ui["lbl_map_icon_hint"] = tb.Label(
+            map_frm,
+            text="可选：自定义 .png/.ico；留空则自动生成彩色字母图标",
+            bootstyle="secondary",
+        )
+        self.ui["lbl_map_icon_hint"].pack(anchor=W, pady=(0, 8))
+
+        btns = tb.Frame(map_frm)
+        btns.pack(fill=X)
+        self.ui["btn_map_upsert"] = tb.Button(btns, text="添加/更新", bootstyle="secondary", command=self.upsert_app_map)
+        self.ui["btn_map_upsert"].pack(side=LEFT, padx=(0, 8))
+        self.ui["btn_map_remove"] = tb.Button(btns, text="删除所选", bootstyle="warning", command=self.remove_app_map)
+        self.ui["btn_map_remove"].pack(side=LEFT)
+        self.ui["btn_save_history"] = tb.Button(map_frm, text="保存", bootstyle="primary", command=self.on_save)
+        self.ui["btn_save_history"].pack(anchor=SE, pady=(10, 0))
+
+    def _reload_app_map_tree(self):
+        self.map_tree.delete(*self.map_tree.get_children())
+        self._map_icon_paths = dict(getattr(self.cfg, "app_icon_map", {}) or {})
+        block_set = set(getattr(self.cfg, "block_bundle", []) or [])
+        for bundle_id, name in sorted((self.cfg.app_bundle_map or {}).items()):
+            skip = i18n.t("yes") if bundle_id in block_set else i18n.t("no")
+            icon = self._map_icon_paths.get(bundle_id, "")
+            icon_show = os.path.basename(icon) if icon else ""
+            self.map_tree.insert("", "end", values=(bundle_id, name, skip, icon_show))
+
+    def _on_map_select(self, _evt=None):
+        sel = self.map_tree.selection()
+        if not sel:
+            return
+        vals = self.map_tree.item(sel[0], "values")
+        bundle_id = vals[0] if len(vals) > 0 else ""
+        name = vals[1] if len(vals) > 1 else ""
+        skip = vals[2] if len(vals) > 2 else i18n.t("no")
+        self.var_map_bundle.set(bundle_id)
+        self.var_map_name.set(name)
+        self.var_map_block.set(skip in (i18n.t("yes"), "是", "Yes", "yes"))
+        self.var_map_icon.set(self._map_icon_paths.get(bundle_id, ""))
+
+    def _on_history_dblclick(self, _evt=None):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        raw = self._hist_raw.get(sel[0], {})
+        bundle_id = raw.get("app") or ""
+        if not bundle_id:
+            return
+        self.var_map_bundle.set(bundle_id)
+        self.var_map_name.set(get_app_display_name(bundle_id, self.cfg))
+        block_set = set(getattr(self.cfg, "block_bundle", []) or [])
+        self.var_map_block.set(bundle_id in block_set)
+
+    def upsert_app_map(self):
+        bundle_id = self.var_map_bundle.get().strip()
+        name = self.var_map_name.get().strip()
+        if not bundle_id:
+            messagebox.showwarning(i18n.t("missing"), i18n.t("fill_bundle_id"))
+            return
+        if not name:
+            name = bundle_id
+        skip = self.var_map_block.get()
+        skip_text = i18n.t("yes") if skip else i18n.t("no")
+        icon_path = self.var_map_icon.get().strip()
+        if icon_path:
+            self._map_icon_paths[bundle_id] = icon_path
+        else:
+            self._map_icon_paths.pop(bundle_id, None)
+        icon_show = os.path.basename(icon_path) if icon_path else ""
+
+        found = None
+        for iid in self.map_tree.get_children():
+            if self.map_tree.item(iid, "values")[0] == bundle_id:
+                found = iid
+                break
+        if found:
+            self.map_tree.item(found, values=(bundle_id, name, skip_text, icon_show))
+        else:
+            self.map_tree.insert("", "end", values=(bundle_id, name, skip_text, icon_show))
+
+    def browse_app_icon(self):
+        path = filedialog.askopenfilename(
+            title="选择应用图标",
+            filetypes=[("Image", "*.png;*.ico;*.jpg;*.jpeg;*.webp"), ("All", "*.*")],
+        )
+        if path:
+            self.var_map_icon.set(path)
+
+    def remove_app_map(self):
+        for iid in list(self.map_tree.selection()):
+            vals = self.map_tree.item(iid, "values")
+            if vals:
+                self._map_icon_paths.pop(str(vals[0]).strip(), None)
+            self.map_tree.delete(iid)
 
     def _build_logs(self):
         frm = tb.Frame(self.tab_logs, padding=12)
@@ -556,48 +1046,102 @@ class App(tb.Window):
         self.txt_logs.pack(fill=BOTH, expand=True)
         self.txt_logs.insert("end", "Ready.\n")
 
+    def insert_template_var(self):
+        token = self.var_tpl_insert.get().strip()
+        if not token:
+            return
+        self.txt_push_template.insert(tk.INSERT, token)
+        self.txt_push_template.focus_set()
+
+    def _on_tpl_preset_change(self, _evt=None):
+        label = self.var_tpl_preset.get().strip()
+        key = "default"
+        if label == i18n.t("tpl_preset_simple"):
+            key = "simple"
+        elif label == i18n.t("tpl_preset_detail"):
+            key = "detail"
+        tpl = PUSH_TEMPLATE_PRESETS.get(key, PUSH_TEMPLATE_PRESETS["default"])
+        self.txt_push_template.delete("1.0", "end")
+        self.txt_push_template.insert("1.0", tpl)
+        if self._last_payload:
+            self._refresh_push_preview(self._last_payload)
+
+    def _get_push_template_text(self) -> str:
+        return self.txt_push_template.get("1.0", "end-1c")
+
+    def _refresh_push_preview(self, payload: dict):
+        tpl = self._get_push_template_text()
+        cfg = self.collect_config()
+        rendered = render_push_template(tpl, payload, cfg)
+        self.push_preview.delete("1.0", "end")
+        self.push_preview.insert("end", rendered + "\n")
+
     # ---------- Actions ----------
     def log(self, s: str):
         self.log_q.put(s)
 
     def on_notification(self, payload: dict):
+        self._last_payload = payload
         bat = payload.get("battery")
         bat_text = f"{bat}%" if isinstance(bat, int) else "--"
+        device_raw = payload.get("device") or ""
+        app_raw = payload.get("app") or ""
+        device_name = get_device_display_name(device_raw, self.cfg)
+        app_name = get_app_display_name(app_raw, self.cfg)
+        date_fmt = format_ancs_date(payload.get("date") or "")
 
         preview_text = (
-            f"Device: {payload.get('device')}\n"
+            f"Device: {device_name}\n"
             f"Battery: {bat_text}\n"
-            f"App: {payload.get('app')}\n"
+            f"App: {app_name} ({app_raw})\n"
             f"Title: {payload.get('title')}\n"
             f"Msg: {payload.get('msg')}\n"
             f"Codes: {' '.join(payload.get('codes') or [])}\n"
-            f"Date: {payload.get('date')}\n"
+            f"Date: {date_fmt}\n"
         )
         self.preview.delete("1.0", "end")
         self.preview.insert("end", preview_text)
+        self._refresh_push_preview(payload)
 
-        # history table
         t = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(payload["ts"]))
         codes = " ".join(payload.get("codes") or [])
-        self.tree.insert(
+        iid = self.tree.insert(
             "", "end",
-            values=(t, payload.get("device", ""), bat_text, payload.get("app", ""),
+            values=(t, device_name, bat_text, app_name,
                     payload.get("title", ""), payload.get("msg", ""), codes)
         )
+        self._hist_raw[iid] = {
+            "app": app_raw,
+            "device": device_raw,
+            "notif_id": payload.get("notif_id") or "",
+        }
+        nid = payload.get("notif_id")
+        if nid:
+            self._notif_to_iid[nid] = iid
 
         # prune
         limit = int(self.safe_int(self.var_history_limit.get(), default=self.cfg.history_limit))
         children = self.tree.get_children()
         if len(children) > max(50, limit):
             for iid in children[: len(children) - limit]:
+                raw = self._hist_raw.pop(iid, {})
+                old_nid = raw.get("notif_id")
+                if old_nid:
+                    self._notif_to_iid.pop(old_nid, None)
                 self.tree.delete(iid)
 
     def on_save(self):
+        self._persist_config(show_msg=True)
+
+    def _persist_config(self, show_msg: bool = True):
         cfg = self.collect_config()
         save_config(CONFIG_PATH, cfg)
         self.cfg = cfg
         self.manager.cfg = cfg
-        messagebox.showinfo(i18n.t("ok"), f"{i18n.t('saved_to')}\n{CONFIG_PATH}")
+        self._sync_popup_toast_from_cfg(cfg)
+        self._reload_app_map_tree()
+        if show_msg:
+            messagebox.showinfo(i18n.t("ok"), f"{i18n.t('saved_to')}\n{CONFIG_PATH}")
 
     def on_start(self):
         if self.running:
@@ -607,6 +1151,7 @@ class App(tb.Window):
         save_config(CONFIG_PATH, cfg)
         self.cfg = cfg
         self.manager.cfg = cfg
+        self._sync_popup_toast_from_cfg(cfg)
 
         addrs = cfg.ble_addresses or []
         if not addrs:
@@ -648,16 +1193,16 @@ class App(tb.Window):
         addr = self.var_add_addr.get().strip()
         if not addr:
             return
-        existing = [self.lst_addr.get(i) for i in range(self.lst_addr.size())]
-        if addr not in existing:
-            self.lst_addr.insert("end", addr)
+        for iid in self.dev_tree.get_children():
+            if self.dev_tree.item(iid, "values")[0] == addr:
+                self.var_add_addr.set("")
+                return
+        self.dev_tree.insert("", "end", values=(addr, ""))
         self.var_add_addr.set("")
 
     def remove_selected_addr(self):
-        sel = list(self.lst_addr.curselection())
-        sel.reverse()
-        for idx in sel:
-            self.lst_addr.delete(idx)
+        for iid in list(self.dev_tree.selection()):
+            self.dev_tree.delete(iid)
 
     def add_block(self):
         s = self.var_block_input.get().strip()
@@ -672,9 +1217,96 @@ class App(tb.Window):
         for idx in sel:
             self.lst_block.delete(idx)
 
+    def _popup_pos_label_from_key(self, key: str) -> str:
+        key = normalize_popup_position(key)
+        return i18n.t(POPUP_POSITION_LABELS.get(key, "misc_popup_pos_br"))
+
+    def _popup_pos_key_from_label(self, label: str) -> str:
+        label = (label or "").strip()
+        for key in ("bottom_right", "top_right", "bottom_left", "top_left"):
+            if i18n.t(POPUP_POSITION_LABELS[key]) == label:
+                return key
+        return normalize_popup_position(getattr(self.cfg, "popup_position", "bottom_right"))
+
+    def _notif_font_label_from_key(self, key) -> str:
+        key = normalize_notification_font_size(key)
+        return i18n.t(NOTIFICATION_FONT_LABELS.get(key, "misc_notif_font_sm"))
+
+    def _notif_font_key_from_label(self, label: str) -> int:
+        label = (label or "").strip()
+        for key in (6, 8, 10, 12):
+            if i18n.t(NOTIFICATION_FONT_LABELS[key]) == label:
+                return key
+        return normalize_notification_font_size(getattr(self.cfg, "notification_font_size", 8))
+
+    def _notif_width_label_from_key(self, key) -> str:
+        key = normalize_notification_width(key)
+        return i18n.t(NOTIFICATION_WIDTH_LABELS.get(key, "misc_notif_width_md"))
+
+    def _notif_width_key_from_label(self, label: str) -> int:
+        label = (label or "").strip()
+        for key in (300, 420, 480, 540):
+            if i18n.t(NOTIFICATION_WIDTH_LABELS[key]) == label:
+                return key
+        return normalize_notification_width(getattr(self.cfg, "notification_width", 420))
+
+    def _sync_popup_toast_from_cfg(self, cfg) -> None:
+        self.popup_toast.apply_ui_settings(
+            popup_position=getattr(cfg, "popup_position", "bottom_right"),
+            notification_width=getattr(cfg, "notification_width", 420),
+            notification_font_size=getattr(cfg, "notification_font_size", 8),
+            privacy_show_title=getattr(cfg, "privacy_show_title", True),
+            privacy_show_msg=getattr(cfg, "privacy_show_msg", True),
+        )
+
     def clear_history(self):
         for iid in self.tree.get_children():
             self.tree.delete(iid)
+        self._hist_raw.clear()
+        self._notif_to_iid.clear()
+
+    def _show_desktop_popup(
+        self,
+        app_name: str,
+        title: str,
+        msg: str,
+        icon_path: str = "",
+        notif_id: str = "",
+        body_text: str = "",
+    ) -> None:
+        def _do():
+            if not bool(self.var_win_toast.get()):
+                return
+            self.popup_toast.show(
+                app_name,
+                title,
+                msg,
+                icon_path=icon_path,
+                notif_id=notif_id,
+                body_text=body_text,
+            )
+
+        try:
+            self.after(0, _do)
+        except tk.TclError:
+            pass
+
+    def open_history_for_notif(self, notif_id: str) -> None:
+        if not notif_id:
+            self.restore_from_tray()
+            self.nb.select(self.tab_history)
+            return
+        iid = self._notif_to_iid.get(notif_id)
+        self.restore_from_tray()
+        self.nb.select(self.tab_history)
+        if not iid:
+            return
+        try:
+            self.tree.selection_set(iid)
+            self.tree.focus(iid)
+            self.tree.see(iid)
+        except tk.TclError:
+            pass
 
     def copy_selected_history(self):
         sel = self.tree.selection()
@@ -693,6 +1325,13 @@ class App(tb.Window):
         self.txt_logs.delete("1.0", "end")
 
     # ---------- Tests ----------
+    def test_desktop_toast(self):
+        if not bool(self.var_win_toast.get()):
+            messagebox.showwarning(i18n.t("missing"), i18n.t("misc_toast_test_disabled"))
+            return
+        self.popup_toast.test_popup()
+        messagebox.showinfo(i18n.t("ok"), i18n.t("misc_toast_test_ok"))
+
     def test_telegram(self):
         token = self.var_tg_token.get().strip()
         chat_id = self.var_tg_chat.get().strip()
@@ -716,6 +1355,17 @@ class App(tb.Window):
             messagebox.showinfo(i18n.t("ok"), "DingTalk test sent")
         except Exception as e:
             messagebox.showerror(i18n.t("fail"), f"DingTalk failed: {e}")
+
+    def test_ntfy(self):
+        url = self.var_ntfy_url.get().strip()
+        if not url:
+            messagebox.showwarning(i18n.t("missing"), "Fill ntfy Topic URL")
+            return
+        try:
+            send_ntfy(url, "✅ ntfy Test: NekoLink OK", "NekoLink Test")
+            messagebox.showinfo(i18n.t("ok"), "ntfy test sent")
+        except Exception as e:
+            messagebox.showerror(i18n.t("fail"), f"ntfy failed: {e}")
 
     def test_gotify(self):
         url = self.var_gotify_url.get().strip()
@@ -764,11 +1414,41 @@ class App(tb.Window):
             self.tray.stop()
         except Exception:
             pass
+        try:
+            self.popup_toast.destroy_all()
+        except Exception:
+            pass
         self.destroy()
 
     # ---------- Config ----------
     def collect_config(self) -> BridgeConfig:
-        addrs = [self.lst_addr.get(i).strip() for i in range(self.lst_addr.size()) if self.lst_addr.get(i).strip()]
+        addrs = []
+        device_aliases: dict = {}
+        for iid in self.dev_tree.get_children():
+            vals = self.dev_tree.item(iid, "values")
+            if not vals or not str(vals[0]).strip():
+                continue
+            addr = str(vals[0]).strip()
+            alias = str(vals[1]).strip() if len(vals) > 1 else ""
+            addrs.append(addr)
+            if alias:
+                device_aliases[addr] = alias
+
+        app_bundle_map: dict = {}
+        block_bundle: list = []
+        for iid in self.map_tree.get_children():
+            vals = self.map_tree.item(iid, "values")
+            if not vals or not str(vals[0]).strip():
+                continue
+            bundle_id = str(vals[0]).strip()
+            name = str(vals[1]).strip() if len(vals) > 1 else bundle_id
+            skip = str(vals[2]).strip() if len(vals) > 2 else i18n.t("no")
+            app_bundle_map[bundle_id] = name
+            if skip in (i18n.t("yes"), "是", "Yes", "yes"):
+                block_bundle.append(bundle_id)
+
+        app_icon_map = {k: v for k, v in (self._map_icon_paths or {}).items() if v and str(v).strip()}
+
         blocks = [self.lst_block.get(i).strip() for i in range(self.lst_block.size()) if self.lst_block.get(i).strip()]
 
         # ui lang
@@ -783,7 +1463,12 @@ class App(tb.Window):
             ui_lang=ui_lang,
 
             ble_addresses=addrs,
+            device_aliases=device_aliases,
             auto_pick_heart_rate=False,
+
+            app_bundle_map=app_bundle_map,
+            app_icon_map=app_icon_map,
+            block_bundle=block_bundle,
 
             enable_telegram=bool(self.var_tg_on.get()),
             telegram_bot_token=self.var_tg_token.get().strip(),
@@ -792,6 +1477,9 @@ class App(tb.Window):
             enable_dingtalk=bool(self.var_dt_on.get()),
             dingtalk_webhook=self.var_dt_webhook.get().strip(),
             dingtalk_secret=self.var_dt_secret.get().strip(),
+
+            enable_ntfy=bool(self.var_ntfy_on.get()),
+            ntfy_url=self.var_ntfy_url.get().strip(),
 
             enable_gotify=bool(self.var_gotify_on.get()),
             gotify_url=self.var_gotify_url.get().strip(),
@@ -821,6 +1509,13 @@ class App(tb.Window):
 
             show_battery_in_message=bool(self.var_show_battery.get()),
             enable_windows_toast=bool(self.var_win_toast.get()),
+            popup_position=self._popup_pos_key_from_label(self.var_popup_pos.get()),
+            notification_width=self._notif_width_key_from_label(self.var_notif_width.get()),
+            notification_font_size=self._notif_font_key_from_label(self.var_notif_font.get()),
+            privacy_show_title=bool(self.var_privacy_show_title.get()),
+            privacy_show_msg=bool(self.var_privacy_show_msg.get()),
+
+            push_template=self._get_push_template_text(),
         )
 
     @staticmethod

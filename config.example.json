@@ -2,6 +2,21 @@
   "ble_addresses": [
     "62:56:29:71:36:67"
   ],
+  "device_aliases": {
+    "62:56:29:71:36:67": "我的 iPhone"
+  },
+  "app_bundle_map": {
+    "com.tencent.xin": "微信",
+    "com.alibaba.DingTalkTalk": "钉钉",
+    "com.tencent.mqq": "QQ",
+    "com.tencent.WeChatWork": "企业微信",
+    "com.apple.MobileSMS": "短信",
+    "com.netease.cloudmusic": "网易云音乐",
+    "com.xiaojukeji.didi": "滴滴"
+  },
+  "block_bundle": [
+    "com.alibaba.DingTalkTalk"
+  ],
   "auto_pick_heart_rate": false,
   "enable_telegram": true,
   "telegram_bot_token": "0",
@@ -16,6 +31,8 @@
   "enable_dingtalk": false,
   "dingtalk_webhook": "",
   "dingtalk_secret": "",
+  "enable_ntfy": false,
+  "ntfy_url": "",
   "dedup_seconds": 8,
   "block_keywords": [],
   "block_case_insensitive": true,
@@ -26,5 +43,11 @@
   "history_limit": 300,
   "autostart_enabled": false,
   "show_battery_in_message": true,
-  "enable_windows_toast": true
+  "enable_windows_toast": true,
+  "popup_position": "bottom_right",
+  "notification_width": 420,
+  "notification_font_size": 8,
+  "privacy_show_title": true,
+  "privacy_show_msg": true,
+  "push_template": "设备：{device}\n【{app}】\n标题：{title}\n内容：{msg}\n时间：{date}\n电量：{battery}"
 }
