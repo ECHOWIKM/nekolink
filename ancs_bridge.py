@@ -419,6 +419,21 @@ def load_config(path: str) -> "BridgeConfig":
             cfg.sound_selected_file = ssf or "notify.wav"
         except Exception:
             cfg.sound_selected_file = "notify.wav"
+        # App 专属音效映射：缺省 {}
+        try:
+            raw_map = getattr(cfg, "app_sound_map", None)
+            if not isinstance(raw_map, dict):
+                cfg.app_sound_map = {}
+            else:
+                cleaned = {}
+                for k, v in raw_map.items():
+                    bundle = str(k or "").strip()
+                    fname = Path(str(v or "").strip()).name
+                    if bundle and fname.lower().endswith(".wav"):
+                        cleaned[bundle] = fname
+                cfg.app_sound_map = cleaned
+        except Exception:
+            cfg.app_sound_map = {}
         return cfg
     except Exception:
         return BridgeConfig()
@@ -510,6 +525,8 @@ class BridgeConfig:
     sound_enable: bool = True
     sound_volume: int = 80
     sound_selected_file: str = "notify.wav"
+    # bundle_id -> wav 文件名（assets/sound/ 下）
+    app_sound_map: Dict[str, str] = field(default_factory=dict)
     auto_backup_enable: bool = False
     auto_backup_path: str = ""
     privacy_show_title: bool = True
@@ -985,7 +1002,7 @@ class BridgeManager:
         try:
             from sound_helper import play_notify_wav
 
-            play_notify_wav(log=self.log)
+            play_notify_wav(app_bundle=str(payload.get("app") or ""), log=self.log)
         except Exception as e:
             self.log(f"[sound] play skipped: {e}")
 

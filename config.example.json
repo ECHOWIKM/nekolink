@@ -53,6 +53,7 @@
   "sound_enable": true,
   "sound_volume": 80,
   "sound_selected_file": "notify.wav",
+  "app_sound_map": {},
   "auto_backup_enable": false,
   "auto_backup_path": "",
   "privacy_show_title": true,

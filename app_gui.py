@@ -50,10 +50,18 @@ from sound_helper import (
     SOUND_AVAILABLE,
     DEFAULT_SOUND_SELECTED_FILE,
     list_wav_filenames,
+    normalize_app_sound_map,
     normalize_sound_selected_file,
     normalize_sound_volume,
+    resolve_sound_path,
     sound_deps_error,
     update_runtime_sound_config,
+)
+from ui_theme import (
+    FONT_HEADER,
+    PAGE_PADX,
+    PAGE_PADY,
+    apply_global_theme,
 )
 
 CONFIG_PATH = get_config_path()
@@ -89,6 +97,8 @@ def _default_auto_backup_path() -> Path:
 class App(tb.Window):
     def __init__(self):
         super().__init__(themename="flatly")
+        # 全局视觉规范：背景 / 字体 / 扁平控件（不改业务）
+        apply_global_theme(self)
 
         self.log_q = queue.Queue()
         self.cfg = load_config(CONFIG_PATH)
@@ -135,6 +145,9 @@ class App(tb.Window):
                 sound_selected_file=normalize_sound_selected_file(
                     getattr(self.cfg, "sound_selected_file", DEFAULT_SOUND_SELECTED_FILE)
                 ),
+                app_sound_map=normalize_app_sound_map(
+                    getattr(self.cfg, "app_sound_map", {}) or {}
+                ),
             )
         except Exception:
             pass
@@ -166,13 +179,13 @@ class App(tb.Window):
 
     # ---------- UI ----------
     def _build_ui(self):
-        root = tb.Frame(self, padding=10)
+        root = tb.Frame(self, padding=(PAGE_PADX, PAGE_PADY))
         root.pack(fill=BOTH, expand=True)
 
         header = tb.Frame(root)
         header.pack(fill=X)
 
-        self.ui["lbl_header"] = tb.Label(header, text="", font=("Segoe UI", 16, "bold"))
+        self.ui["lbl_header"] = tb.Label(header, text="", font=FONT_HEADER)
         self.ui["lbl_header"].pack(side=LEFT)
 
         # language selector (right)
@@ -240,6 +253,8 @@ class App(tb.Window):
         self._build_misc()
         self._build_history()
         self._build_logs()
+        # 构建后再次对齐主题，避免部分控件沿用主题默认灰底
+        apply_global_theme(self)
 
     def apply_i18n(self):
         self.title(i18n.t("app_title"))
@@ -396,7 +411,7 @@ class App(tb.Window):
 
     # ---------- Tabs ----------
     def _build_main(self):
-        frm = tb.Frame(self.tab_main, padding=12)
+        frm = tb.Frame(self.tab_main, padding=(PAGE_PADX, PAGE_PADY))
         frm.pack(fill=BOTH, expand=True)
 
         left = tb.Frame(frm)
@@ -497,7 +512,7 @@ class App(tb.Window):
         self._last_payload: Optional[dict] = None
 
     def _build_devices(self):
-        frm = tb.Frame(self.tab_devices, padding=12)
+        frm = tb.Frame(self.tab_devices, padding=(PAGE_PADX, PAGE_PADY))
         frm.pack(fill=BOTH, expand=True)
 
         top = tb.Frame(frm)
@@ -599,7 +614,7 @@ class App(tb.Window):
 
     # ✅ Destinations: scrollable + fixed bottom Save
     def _build_dest(self):
-        outer = tb.Frame(self.tab_dest, padding=12)
+        outer = tb.Frame(self.tab_dest, padding=(PAGE_PADX, PAGE_PADY))
         outer.pack(fill=BOTH, expand=True)
 
         # scroll area
@@ -771,7 +786,7 @@ class App(tb.Window):
         self.ui["btn_save_dest"].pack(side=RIGHT)
 
     def _build_filter(self):
-        frm = tb.Frame(self.tab_filter, padding=12)
+        frm = tb.Frame(self.tab_filter, padding=(PAGE_PADX, PAGE_PADY))
         frm.pack(fill=BOTH, expand=True)
 
         self.ui["lbl_block_intro"] = tb.Label(frm, text="", font=("Segoe UI", 12, "bold"))
@@ -800,7 +815,7 @@ class App(tb.Window):
         self.ui["btn_save_filter"].pack(anchor=SE, pady=(10, 0))
 
     def _build_misc(self):
-        frm = tb.Frame(self.tab_misc, padding=10)
+        frm = tb.Frame(self.tab_misc, padding=(PAGE_PADX, PAGE_PADY))
         frm.pack(fill=BOTH, expand=True)
 
         self.ui["lbl_misc_title"] = tb.Label(frm, text="", font=("Segoe UI", 12, "bold"))
@@ -1018,16 +1033,20 @@ class App(tb.Window):
         self.scl_sound_volume.set(self.var_sound_volume.get())
         self.scl_sound_volume.pack(side=LEFT, fill=X, expand=True)
         # 启动时同步内存运行时，避免未点保存前读到默认值
+        self._app_sound_map = normalize_app_sound_map(
+            getattr(self.cfg, "app_sound_map", {}) or {}
+        )
         update_runtime_sound_config(
             sound_enable=bool(self.var_sound_enable.get()),
             sound_volume=normalize_sound_volume(self.var_sound_volume.get()),
             sound_selected_file=normalize_sound_selected_file(
                 self.var_sound_file.get() or DEFAULT_SOUND_SELECTED_FILE
             ),
+            app_sound_map=dict(self._app_sound_map),
         )
         self.ui["lbl_sound_hint"] = tb.Label(
             sound_frm,
-            text="提示：将 .wav 放入 assets/sound/ 后重启可出现在下拉框；发声时音量合成器会出现 NekoLink 滑块",
+            text="提示：将 .wav 放入 assets/sound/ 后重启可出现在下拉框；按 App 专属音效请到「历史→应用名称映射」设置",
             bootstyle="secondary",
             wraplength=520,
             justify=LEFT,
@@ -1193,23 +1212,29 @@ class App(tb.Window):
         self.ui["lbl_app_map"].pack(anchor=W)
         self.ui["lbl_map_hint"] = tb.Label(
             map_frm,
-            text="双击上方历史记录可快速填入 Bundle ID。保存后写入 config.json。",
+            text="双击上方历史可填入 Bundle ID；可为每个 App 选定专属提示音。保存后写入 config.json。",
             bootstyle="secondary",
         )
         self.ui["lbl_map_hint"].pack(anchor=W, pady=(0, 8))
 
         self.map_tree = tb.Treeview(
-            map_frm, columns=("bundle", "name", "block", "icon"), show="headings", height=5, selectmode="browse"
+            map_frm,
+            columns=("bundle", "name", "block", "icon", "sound"),
+            show="headings",
+            height=5,
+            selectmode="browse",
         )
         self.ui["map_tree"] = self.map_tree
         self.map_tree.heading("bundle", text="Bundle ID")
         self.map_tree.heading("name", text="显示名称")
         self.map_tree.heading("block", text="跳过 webhook")
         self.map_tree.heading("icon", text="图标")
-        self.map_tree.column("bundle", width=220, anchor=W)
-        self.map_tree.column("name", width=120, anchor=W)
-        self.map_tree.column("block", width=90, anchor=W)
-        self.map_tree.column("icon", width=100, anchor=W)
+        self.map_tree.heading("sound", text="提示音")
+        self.map_tree.column("bundle", width=200, anchor=W)
+        self.map_tree.column("name", width=100, anchor=W)
+        self.map_tree.column("block", width=80, anchor=W)
+        self.map_tree.column("icon", width=90, anchor=W)
+        self.map_tree.column("sound", width=120, anchor=W)
         self.map_tree.pack(fill=X, pady=(0, 8))
         self.map_tree.bind("<<TreeviewSelect>>", self._on_map_select)
         self._reload_app_map_tree()
@@ -1237,9 +1262,38 @@ class App(tb.Window):
         self.ui["lbl_map_icon"] = tb.Label(icon_row, text="应用图标")
         self.ui["lbl_map_icon"].pack(side=LEFT, padx=(0, 8))
         self.var_map_icon = tk.StringVar()
-        tb.Entry(icon_row, textvariable=self.var_map_icon, width=52).pack(side=LEFT, padx=(0, 8))
+        tb.Entry(icon_row, textvariable=self.var_map_icon, width=40).pack(side=LEFT, padx=(0, 8))
         self.ui["btn_map_icon"] = tb.Button(icon_row, text="浏览...", bootstyle="secondary", command=self.browse_app_icon)
         self.ui["btn_map_icon"].pack(side=LEFT)
+
+        sound_row = tb.Frame(map_frm)
+        sound_row.pack(fill=X, pady=(0, 4))
+        self.ui["lbl_map_sound"] = tb.Label(sound_row, text="专属提示音")
+        self.ui["lbl_map_sound"].pack(side=LEFT, padx=(0, 8))
+        if not hasattr(self, "_sound_wav_list"):
+            self._sound_wav_list = list_wav_filenames(log=self.log)
+        if not hasattr(self, "_app_sound_map"):
+            self._app_sound_map = normalize_app_sound_map(
+                getattr(self.cfg, "app_sound_map", {}) or {}
+            )
+        self._map_sound_global_label = "(使用全局默认)"
+        sound_values = [self._map_sound_global_label] + list(self._sound_wav_list or [])
+        self.var_map_sound = tk.StringVar(value=self._map_sound_global_label)
+        self.ui["cmb_map_sound"] = tb.Combobox(
+            sound_row,
+            textvariable=self.var_map_sound,
+            values=sound_values,
+            state="readonly" if self._sound_wav_list else "disabled",
+            width=28,
+        )
+        self.ui["cmb_map_sound"].pack(side=LEFT)
+        self.ui["lbl_map_sound_hint"] = tb.Label(
+            map_frm,
+            text="双击历史填入包名后，在此选定专属 wav；选「使用全局默认」则走杂项全局音效",
+            bootstyle="secondary",
+        )
+        self.ui["lbl_map_sound_hint"].pack(anchor=W, pady=(0, 4))
+
         self.ui["lbl_map_icon_hint"] = tb.Label(
             map_frm,
             text="可选：自定义 .png/.ico；留空则自动生成彩色字母图标",
@@ -1259,12 +1313,30 @@ class App(tb.Window):
     def _reload_app_map_tree(self):
         self.map_tree.delete(*self.map_tree.get_children())
         self._map_icon_paths = dict(getattr(self.cfg, "app_icon_map", {}) or {})
+        if not hasattr(self, "_app_sound_map"):
+            self._app_sound_map = normalize_app_sound_map(
+                getattr(self.cfg, "app_sound_map", {}) or {}
+            )
         block_set = set(getattr(self.cfg, "block_bundle", []) or [])
+        global_lbl = getattr(self, "_map_sound_global_label", "(使用全局默认)")
         for bundle_id, name in sorted((self.cfg.app_bundle_map or {}).items()):
             skip = i18n.t("yes") if bundle_id in block_set else i18n.t("no")
             icon = self._map_icon_paths.get(bundle_id, "")
             icon_show = os.path.basename(icon) if icon else ""
-            self.map_tree.insert("", "end", values=(bundle_id, name, skip, icon_show))
+            sound_show = (self._app_sound_map or {}).get(bundle_id, "") or global_lbl
+            self.map_tree.insert(
+                "", "end", values=(bundle_id, name, skip, icon_show, sound_show)
+            )
+
+    def _set_map_sound_var(self, bundle_id: str) -> None:
+        global_lbl = getattr(self, "_map_sound_global_label", "(使用全局默认)")
+        if not hasattr(self, "var_map_sound"):
+            return
+        fname = (getattr(self, "_app_sound_map", {}) or {}).get(bundle_id, "")
+        if fname and fname in (self._sound_wav_list or []):
+            self.var_map_sound.set(fname)
+        else:
+            self.var_map_sound.set(global_lbl)
 
     def _on_map_select(self, _evt=None):
         sel = self.map_tree.selection()
@@ -1278,6 +1350,7 @@ class App(tb.Window):
         self.var_map_name.set(name)
         self.var_map_block.set(skip in (i18n.t("yes"), "是", "Yes", "yes"))
         self.var_map_icon.set(self._map_icon_paths.get(bundle_id, ""))
+        self._set_map_sound_var(bundle_id)
 
     def _on_history_dblclick(self, _evt=None):
         sel = self.tree.selection()
@@ -1291,6 +1364,8 @@ class App(tb.Window):
         self.var_map_name.set(get_app_display_name(bundle_id, self.cfg))
         block_set = set(getattr(self.cfg, "block_bundle", []) or [])
         self.var_map_block.set(bundle_id in block_set)
+        self.var_map_icon.set((getattr(self.cfg, "app_icon_map", {}) or {}).get(bundle_id, ""))
+        self._set_map_sound_var(bundle_id)
 
     def upsert_app_map(self):
         bundle_id = self.var_map_bundle.get().strip()
@@ -1309,15 +1384,33 @@ class App(tb.Window):
             self._map_icon_paths.pop(bundle_id, None)
         icon_show = os.path.basename(icon_path) if icon_path else ""
 
+        global_lbl = getattr(self, "_map_sound_global_label", "(使用全局默认)")
+        sound_sel = (self.var_map_sound.get() if hasattr(self, "var_map_sound") else "") or ""
+        sound_sel = sound_sel.strip()
+        if not hasattr(self, "_app_sound_map") or self._app_sound_map is None:
+            self._app_sound_map = {}
+        if sound_sel and sound_sel != global_lbl:
+            fname = normalize_sound_selected_file(sound_sel)
+            if fname not in (self._sound_wav_list or []) or not resolve_sound_path(fname).is_file():
+                messagebox.showwarning("提示", f"音效文件不存在：{fname}")
+                return
+            self._app_sound_map[bundle_id] = fname
+            sound_show = fname
+        else:
+            self._app_sound_map.pop(bundle_id, None)
+            sound_show = global_lbl
+        self._sync_app_sound_map_runtime()
+
         found = None
         for iid in self.map_tree.get_children():
             if self.map_tree.item(iid, "values")[0] == bundle_id:
                 found = iid
                 break
+        row = (bundle_id, name, skip_text, icon_show, sound_show)
         if found:
-            self.map_tree.item(found, values=(bundle_id, name, skip_text, icon_show))
+            self.map_tree.item(found, values=row)
         else:
-            self.map_tree.insert("", "end", values=(bundle_id, name, skip_text, icon_show))
+            self.map_tree.insert("", "end", values=row)
 
     def browse_app_icon(self):
         path = filedialog.askopenfilename(
@@ -1331,8 +1424,12 @@ class App(tb.Window):
         for iid in list(self.map_tree.selection()):
             vals = self.map_tree.item(iid, "values")
             if vals:
-                self._map_icon_paths.pop(str(vals[0]).strip(), None)
+                bid = str(vals[0]).strip()
+                self._map_icon_paths.pop(bid, None)
+                if hasattr(self, "_app_sound_map"):
+                    self._app_sound_map.pop(bid, None)
             self.map_tree.delete(iid)
+        self._sync_app_sound_map_runtime()
 
     def _build_logs(self):
         frm = tb.Frame(self.tab_logs, padding=12)
@@ -1485,7 +1582,19 @@ class App(tb.Window):
                 sound_selected_file=normalize_sound_selected_file(
                     getattr(cfg, "sound_selected_file", DEFAULT_SOUND_SELECTED_FILE)
                 ),
+                app_sound_map=normalize_app_sound_map(
+                    getattr(cfg, "app_sound_map", {}) or {}
+                ),
             )
+            # 同步历史映射表中的专属音效列
+            try:
+                self._app_sound_map = normalize_app_sound_map(
+                    getattr(cfg, "app_sound_map", {}) or {}
+                )
+                if hasattr(self, "map_tree"):
+                    self._reload_app_map_tree()
+            except Exception:
+                pass
             # 上限调高时立刻从排队队列补弹
             try:
                 self.popup_toast.drain_ui_pop_queue()
@@ -1505,7 +1614,8 @@ class App(tb.Window):
                 f"preview={getattr(cfg, 'max_preview_chars', 50)}, "
                 f"auto_close={secs}s, "
                 f"sound={getattr(cfg, 'sound_enable', True)}/{getattr(cfg, 'sound_volume', 80)}/"
-                f"{getattr(cfg, 'sound_selected_file', DEFAULT_SOUND_SELECTED_FILE)}"
+                f"{getattr(cfg, 'sound_selected_file', DEFAULT_SOUND_SELECTED_FILE)}/"
+                f"app_sounds={len(getattr(cfg, 'app_sound_map', {}) or {})}"
             )
             return True
         except Exception as e:
@@ -1697,6 +1807,13 @@ class App(tb.Window):
         update_runtime_sound_config(sound_volume=n)
         if self.manager is not None:
             self.manager.cfg.sound_volume = n
+
+    def _sync_app_sound_map_runtime(self) -> None:
+        mapping = normalize_app_sound_map(getattr(self, "_app_sound_map", {}) or {})
+        self._app_sound_map = mapping
+        update_runtime_sound_config(app_sound_map=dict(mapping))
+        if self.manager is not None:
+            self.manager.cfg.app_sound_map = dict(mapping)
 
     def _resolve_auto_backup_path(self) -> Path:
         custom = (self.var_auto_backup_path.get() if hasattr(self, "var_auto_backup_path") else "") or ""
@@ -2043,6 +2160,9 @@ class App(tb.Window):
                 self.var_sound_file.get()
                 if hasattr(self, "var_sound_file")
                 else DEFAULT_SOUND_SELECTED_FILE
+            ),
+            app_sound_map=normalize_app_sound_map(
+                getattr(self, "_app_sound_map", {}) or {}
             ),
             auto_backup_enable=bool(self.var_auto_backup.get()),
             auto_backup_path=self.var_auto_backup_path.get().strip(),

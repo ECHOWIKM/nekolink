@@ -88,11 +88,17 @@ _runtime_config = {
     "sound_enable": DEFAULT_SOUND_ENABLE,
     "sound_volume": DEFAULT_SOUND_VOLUME,
     "sound_selected_file": DEFAULT_SOUND_SELECTED_FILE,
+    "app_sound_map": {},  # bundle_id -> wav filename
 }
 
 _active_plays: List[object] = []
 _play_lock = threading.Lock()
-_last_play_at = 0.0
+
+# QQ 风格提示音防抖：窗口期内只响一次（仅限制声音，不影响弹窗/转发）
+_last_sound_trigger_time = 0
+SOUND_DEBOUNCE_MS = 2000
+_sound_debounce_lock = threading.Lock()
+_sound_play_pending = False
 
 
 def sound_deps_error() -> str:
@@ -124,14 +130,41 @@ def normalize_sound_selected_file(name) -> str:
     return s
 
 
+def normalize_app_sound_map(raw) -> dict:
+    """
+    规范化 app_sound_map：只保留 包名 -> 存在的 wav 文件名。
+    缺失/非法项丢弃；不崩溃。
+    """
+    out: dict = {}
+    if not isinstance(raw, dict):
+        return out
+    available = set(list_wav_filenames())
+    for k, v in raw.items():
+        bundle = str(k or "").strip()
+        if not bundle:
+            continue
+        fname = Path(str(v or "").strip()).name
+        if not fname.lower().endswith(".wav"):
+            continue
+        if available and fname not in available:
+            continue
+        if not resolve_sound_path(fname).is_file():
+            continue
+        out[bundle] = fname
+    return out
+
+
 def get_runtime_sound_config() -> dict:
-    return dict(_runtime_config)
+    cfg = dict(_runtime_config)
+    cfg["app_sound_map"] = dict(_runtime_config.get("app_sound_map") or {})
+    return cfg
 
 
 def update_runtime_sound_config(
     sound_enable: Optional[bool] = None,
     sound_volume: Optional[int] = None,
     sound_selected_file: Optional[str] = None,
+    app_sound_map: Optional[dict] = None,
 ) -> None:
     """由 UI / reload_runtime_config 调用，刷新内存中的提示音配置。"""
     if sound_enable is not None:
@@ -142,6 +175,8 @@ def update_runtime_sound_config(
         _runtime_config["sound_selected_file"] = normalize_sound_selected_file(
             sound_selected_file
         )
+    if app_sound_map is not None:
+        _runtime_config["app_sound_map"] = normalize_app_sound_map(app_sound_map)
 
 
 def app_base_dir() -> Path:
@@ -567,6 +602,7 @@ def _play_pcm(
 
 def play_notify_wav(
     *,
+    app_bundle: Optional[str] = None,
     sound_enable: Optional[bool] = None,
     sound_volume: Optional[int] = None,
     sound_selected_file: Optional[str] = None,
@@ -575,9 +611,10 @@ def play_notify_wav(
 ) -> None:
     """
     去重后的新通知调用：读取内存 runtime_config，播放选中的 wav。
-    simpleaudio 优先；不可用时回退 winmm（仍只播 wav，无格式转换）。
+    优先 App 专属音效（app_sound_map），否则全局 sound_selected_file。
+    防抖：SOUND_DEBOUNCE_MS 窗口期内只成功播放一次；弹窗/转发不受影响。
     """
-    global _last_play_at
+    global _last_sound_trigger_time, _sound_play_pending
     _ = base_dir
 
     if (
@@ -598,10 +635,31 @@ def play_notify_wav(
     selected = normalize_sound_selected_file(
         _runtime_config.get("sound_selected_file", DEFAULT_SOUND_SELECTED_FILE)
     )
+    bundle = str(app_bundle or "").strip()
+    app_map = _runtime_config.get("app_sound_map") or {}
+    sound_source = "global"
+
+    # 优先 App 专属音效
+    if bundle and isinstance(app_map, dict) and bundle in app_map:
+        candidate = normalize_sound_selected_file(app_map.get(bundle))
+        cand_path = resolve_sound_path(candidate)
+        if cand_path.is_file():
+            selected = candidate
+            sound_source = "app"
+            _log(
+                log,
+                f"[Sound] 使用App专属音效 bundle={bundle} file={selected}",
+            )
+        else:
+            _log(
+                log,
+                f"[Sound] App专属音效文件丢失，回退全局音效 bundle={bundle}",
+            )
+
     _log(
         log,
         f"[Sound] sound_enable={enable}, vol={vol_percent}, "
-        f"file={selected}, backend={_BACKEND}",
+        f"file={selected}, source={sound_source}, backend={_BACKEND}",
     )
 
     if not enable:
@@ -616,17 +674,26 @@ def play_notify_wav(
         _log(log, "[Sound] volume=0，跳过播放")
         return
 
-    now = time.time()
-    if now - _last_play_at < 0.15:
-        return
-    _last_play_at = now
+    now_ms = int(time.time() * 1000)
+    with _sound_debounce_lock:
+        elapsed = now_ms - _last_sound_trigger_time
+        if _sound_play_pending or (
+            _last_sound_trigger_time > 0 and elapsed < SOUND_DEBOUNCE_MS
+        ):
+            _log(log, "[Sound] 防抖屏蔽，窗口期内，跳过音效")
+            return
+        # 占位，避免并发通知在播完前再次通过防抖
+        _sound_play_pending = True
+        trigger_ms = now_ms
 
     def _worker():
+        global _last_sound_trigger_time, _sound_play_pending
+        played_ok = False
         try:
             sound_path = resolve_sound_path(selected)
             play_name = selected
             if not sound_path.is_file():
-                _log(log, f"[Sound] 选中音效不存在，回退默认: {sound_path}")
+                _log(log, f"[Sound] 音效不存在，回退默认 notify.wav: {sound_path}")
                 play_name = DEFAULT_SOUND_SELECTED_FILE
                 sound_path = resolve_sound_path(DEFAULT_SOUND_SELECTED_FILE)
                 if not sound_path.is_file():
@@ -639,6 +706,7 @@ def play_notify_wav(
                     wave_obj = _simpleaudio.WaveObject.from_wave_file(str(sound_path))
                     play_obj = wave_obj.play()
                     _retain_play(play_obj)
+                    played_ok = True
                     _log(log, f"[Sound] 播放音效:{play_name} 音量:{vol:.2f}")
                     for _ in range(15):
                         if _apply_pycaw_session_volume(1.0):
@@ -651,6 +719,7 @@ def play_notify_wav(
             try:
                 frames, nchannels, sampwidth, framerate = _load_pcm_from_wav(sound_path)
                 _play_pcm(frames, nchannels, sampwidth, framerate, vol)
+                played_ok = True
                 _log(log, f"[Sound] 播放音效:{play_name} 音量:{vol:.2f}")
             except Exception as e_pcm:
                 # 仍失败：用 Windows 系统解码（兼容旧 QQ ADPCM 等）
@@ -658,11 +727,18 @@ def play_notify_wav(
                 if sys.platform != "win32":
                     raise
                 _play_via_winsound_file(sound_path)
+                played_ok = True
                 _log(
                     log,
                     f"[Sound] 播放音效:{play_name} 音量:{vol:.2f} (系统播放，滑块可能不完全生效)",
                 )
         except Exception as e:
             _log(log, f"[Sound] 播放异常: {e}")
+        finally:
+            with _sound_debounce_lock:
+                if played_ok:
+                    # 仅成功播放才刷新防抖时间戳
+                    _last_sound_trigger_time = trigger_ms
+                _sound_play_pending = False
 
     threading.Thread(target=_worker, daemon=True).start()
