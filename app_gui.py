@@ -46,6 +46,15 @@ from popup_toast import (
     NOTIFICATION_WIDTH_LABELS,
     NOTIFICATION_FONT_LABELS,
 )
+from sound_helper import (
+    SOUND_AVAILABLE,
+    DEFAULT_SOUND_SELECTED_FILE,
+    list_wav_filenames,
+    normalize_sound_selected_file,
+    normalize_sound_volume,
+    sound_deps_error,
+    update_runtime_sound_config,
+)
 
 CONFIG_PATH = get_config_path()
 ICON_PATH = "icon.ico"
@@ -118,6 +127,17 @@ class App(tb.Window):
             self.on_notification,
             on_desktop_popup=self._show_desktop_popup,
         )
+        # 启动即把提示音配置写入 sound_helper 内存运行时
+        try:
+            update_runtime_sound_config(
+                sound_enable=bool(getattr(self.cfg, "sound_enable", True)),
+                sound_volume=normalize_sound_volume(getattr(self.cfg, "sound_volume", 80)),
+                sound_selected_file=normalize_sound_selected_file(
+                    getattr(self.cfg, "sound_selected_file", DEFAULT_SOUND_SELECTED_FILE)
+                ),
+            )
+        except Exception:
+            pass
 
         # 启动即确保 backup 目录存在
         try:
@@ -342,6 +362,12 @@ class App(tb.Window):
         if "lbl_auto_close" in self.ui:
             self.ui["lbl_auto_close"].config(text=i18n.t("misc_auto_close"))
             self.ui["lbl_auto_close_hint"].config(text=i18n.t("misc_auto_close_hint"))
+        if "chk_sound_enable" in self.ui:
+            self.ui["chk_sound_enable"].config(text=i18n.t("misc_sound_enable"))
+            if "lbl_sound_file" in self.ui:
+                self.ui["lbl_sound_file"].config(text=i18n.t("misc_sound_file"))
+            self.ui["lbl_sound_volume"].config(text=i18n.t("misc_sound_volume"))
+            self.ui["lbl_sound_hint"].config(text=i18n.t("misc_sound_hint"))
         if "chk_auto_backup" in self.ui:
             self.ui["chk_auto_backup"].config(text=i18n.t("misc_auto_backup"))
             self.ui["lbl_auto_backup_hint"].config(text=i18n.t("misc_auto_backup_hint"))
@@ -926,6 +952,102 @@ class App(tb.Window):
         )
         self.ui["lbl_auto_close_hint"].pack(anchor=W, pady=(0, 3))
 
+        sound_frm = tb.Frame(frm)
+        sound_frm.pack(fill=X, anchor=W, pady=(2, 3))
+        self.var_sound_enable = tk.BooleanVar(
+            value=bool(getattr(self.cfg, "sound_enable", True))
+        )
+        self.ui["chk_sound_enable"] = tb.Checkbutton(
+            sound_frm,
+            text="启用通知提示音",
+            variable=self.var_sound_enable,
+            bootstyle="round-toggle",
+            command=self._on_sound_enable_toggle,
+        )
+        self.ui["chk_sound_enable"].pack(anchor=W)
+
+        # 音效文件下拉：启动扫描 assets/sound/*.wav
+        file_row = tb.Frame(sound_frm)
+        file_row.pack(fill=X, anchor=W, pady=(2, 0))
+        self.ui["lbl_sound_file"] = tb.Label(file_row, text="提示音音效文件:")
+        self.ui["lbl_sound_file"].pack(side=LEFT, padx=(0, 8))
+        self._sound_wav_list = list_wav_filenames(log=self.log)
+        saved_sound = normalize_sound_selected_file(
+            getattr(self.cfg, "sound_selected_file", DEFAULT_SOUND_SELECTED_FILE)
+        )
+        if self._sound_wav_list:
+            if saved_sound not in self._sound_wav_list:
+                if DEFAULT_SOUND_SELECTED_FILE in self._sound_wav_list:
+                    saved_sound = DEFAULT_SOUND_SELECTED_FILE
+                else:
+                    saved_sound = self._sound_wav_list[0]
+        else:
+            saved_sound = ""
+        self.var_sound_file = tk.StringVar(value=saved_sound)
+        self.ui["cmb_sound_file"] = tb.Combobox(
+            file_row,
+            textvariable=self.var_sound_file,
+            values=self._sound_wav_list,
+            state="readonly" if self._sound_wav_list else "disabled",
+            width=28,
+        )
+        self.ui["cmb_sound_file"].pack(side=LEFT, fill=X, expand=True)
+        self.ui["cmb_sound_file"].bind(
+            "<<ComboboxSelected>>", lambda _e: self._on_sound_file_selected()
+        )
+
+        vol_row = tb.Frame(sound_frm)
+        vol_row.pack(fill=X, anchor=W, pady=(2, 0))
+        self.ui["lbl_sound_volume"] = tb.Label(vol_row, text="提示音音量")
+        self.ui["lbl_sound_volume"].pack(side=LEFT, padx=(0, 8))
+        self.var_sound_volume = tk.IntVar(
+            value=normalize_sound_volume(getattr(self.cfg, "sound_volume", 80))
+        )
+        self.ui["lbl_sound_volume_val"] = tb.Label(
+            vol_row, text=str(self.var_sound_volume.get()), width=3
+        )
+        self.ui["lbl_sound_volume_val"].pack(side=LEFT, padx=(0, 8))
+        self.scl_sound_volume = tb.Scale(
+            vol_row,
+            from_=0,
+            to=100,
+            orient=HORIZONTAL,
+            length=180,
+            command=lambda v: self._on_sound_volume_scale(v),
+        )
+        self.scl_sound_volume.set(self.var_sound_volume.get())
+        self.scl_sound_volume.pack(side=LEFT, fill=X, expand=True)
+        # 启动时同步内存运行时，避免未点保存前读到默认值
+        update_runtime_sound_config(
+            sound_enable=bool(self.var_sound_enable.get()),
+            sound_volume=normalize_sound_volume(self.var_sound_volume.get()),
+            sound_selected_file=normalize_sound_selected_file(
+                self.var_sound_file.get() or DEFAULT_SOUND_SELECTED_FILE
+            ),
+        )
+        self.ui["lbl_sound_hint"] = tb.Label(
+            sound_frm,
+            text="提示：将 .wav 放入 assets/sound/ 后重启可出现在下拉框；发声时音量合成器会出现 NekoLink 滑块",
+            bootstyle="secondary",
+            wraplength=520,
+            justify=LEFT,
+        )
+        self.ui["lbl_sound_hint"].pack(anchor=W, pady=(2, 0))
+        if not SOUND_AVAILABLE or not self._sound_wav_list:
+            try:
+                self.ui["chk_sound_enable"].configure(state="disabled")
+                self.scl_sound_volume.configure(state="disabled")
+                if "cmb_sound_file" in self.ui:
+                    self.ui["cmb_sound_file"].configure(state="disabled")
+                if not SOUND_AVAILABLE:
+                    self.log(
+                        f"[sound] {i18n.t('misc_sound_deps_missing')} ({sound_deps_error()})"
+                    )
+                elif not self._sound_wav_list:
+                    self.log("[Sound] assets/sound/ 无 wav，提示音静默")
+            except Exception:
+                pass
+
         backup_frm = tb.Frame(frm)
         backup_frm.pack(fill=X, anchor=W, pady=(2, 3))
         self.var_auto_backup = tk.BooleanVar(value=bool(getattr(self.cfg, "auto_backup_enable", False)))
@@ -1356,6 +1478,14 @@ class App(tb.Window):
                 getattr(cfg, "notification_auto_close_seconds", 8)
             )
             self.popup_toast.duration_ms = secs * 1000
+            # 提示音：热加载写入 sound_helper 内存运行时（play 只读这里）
+            update_runtime_sound_config(
+                sound_enable=bool(getattr(cfg, "sound_enable", True)),
+                sound_volume=normalize_sound_volume(getattr(cfg, "sound_volume", 80)),
+                sound_selected_file=normalize_sound_selected_file(
+                    getattr(cfg, "sound_selected_file", DEFAULT_SOUND_SELECTED_FILE)
+                ),
+            )
             # 上限调高时立刻从排队队列补弹
             try:
                 self.popup_toast.drain_ui_pop_queue()
@@ -1373,7 +1503,9 @@ class App(tb.Window):
                 f"icons={len(cfg.app_icon_map or {})}, "
                 f"max_pop={getattr(cfg, 'max_pop_notification', 3)}, "
                 f"preview={getattr(cfg, 'max_preview_chars', 50)}, "
-                f"auto_close={secs}s"
+                f"auto_close={secs}s, "
+                f"sound={getattr(cfg, 'sound_enable', True)}/{getattr(cfg, 'sound_volume', 80)}/"
+                f"{getattr(cfg, 'sound_selected_file', DEFAULT_SOUND_SELECTED_FILE)}"
             )
             return True
         except Exception as e:
@@ -1528,6 +1660,43 @@ class App(tb.Window):
         self.popup_toast.apply_ui_settings(max_pop_notification=n)
         if self.running and self.manager:
             self.manager.cfg.max_pop_notification = n
+
+    def _on_sound_enable_toggle(self) -> None:
+        # ttkbootstrap toggle 有时在 command 触发瞬间 var 尚未翻转，延后一拍读取
+        self.after(20, self._sync_sound_enable_from_ui)
+
+    def _sync_sound_enable_from_ui(self) -> None:
+        enable = bool(self.var_sound_enable.get())
+        update_runtime_sound_config(sound_enable=enable)
+        if self.manager is not None:
+            self.manager.cfg.sound_enable = enable
+        self.log(f"[Sound] UI enable -> runtime sound_enable={enable}")
+
+    def _on_sound_file_selected(self) -> None:
+        name = normalize_sound_selected_file(
+            self.var_sound_file.get() or DEFAULT_SOUND_SELECTED_FILE
+        )
+        self.var_sound_file.set(name)
+        update_runtime_sound_config(sound_selected_file=name)
+        if self.manager is not None:
+            self.manager.cfg.sound_selected_file = name
+        self.log(f"[Sound] UI file -> runtime sound_selected_file={name}")
+
+    def _on_sound_volume_scale(self, value) -> None:
+        # ttkbootstrap Scale 可能给 0~1 或 0~100
+        try:
+            fv = float(value)
+        except (TypeError, ValueError):
+            fv = float(self.var_sound_volume.get())
+        if 0.0 <= fv <= 1.0:
+            fv = fv * 100.0
+        n = normalize_sound_volume(fv)
+        self.var_sound_volume.set(n)
+        if "lbl_sound_volume_val" in self.ui:
+            self.ui["lbl_sound_volume_val"].config(text=str(n))
+        update_runtime_sound_config(sound_volume=n)
+        if self.manager is not None:
+            self.manager.cfg.sound_volume = n
 
     def _resolve_auto_backup_path(self) -> Path:
         custom = (self.var_auto_backup_path.get() if hasattr(self, "var_auto_backup_path") else "") or ""
@@ -1865,6 +2034,15 @@ class App(tb.Window):
             max_pop_notification=normalize_max_pop_notification(self.var_max_pop.get()),
             notification_auto_close_seconds=normalize_notification_auto_close_seconds(
                 self.var_auto_close.get() if hasattr(self, "var_auto_close") else 8
+            ),
+            sound_enable=bool(self.var_sound_enable.get()) if hasattr(self, "var_sound_enable") else True,
+            sound_volume=normalize_sound_volume(
+                self.var_sound_volume.get() if hasattr(self, "var_sound_volume") else 80
+            ),
+            sound_selected_file=normalize_sound_selected_file(
+                self.var_sound_file.get()
+                if hasattr(self, "var_sound_file")
+                else DEFAULT_SOUND_SELECTED_FILE
             ),
             auto_backup_enable=bool(self.var_auto_backup.get()),
             auto_backup_path=self.var_auto_backup_path.get().strip(),

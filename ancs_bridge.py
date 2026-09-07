@@ -401,6 +401,24 @@ def load_config(path: str) -> "BridgeConfig":
             cfg.notification_auto_close_seconds = max(3, min(120, v))
         except Exception:
             cfg.notification_auto_close_seconds = 8
+        # 提示音：缺省 true / 80 / notify.wav，音量钳位 0–100
+        try:
+            cfg.sound_enable = bool(getattr(cfg, "sound_enable", True))
+        except Exception:
+            cfg.sound_enable = True
+        try:
+            sv = int(float(str(getattr(cfg, "sound_volume", 80)).strip()))
+            cfg.sound_volume = max(0, min(100, sv))
+        except Exception:
+            cfg.sound_volume = 80
+        try:
+            ssf = str(getattr(cfg, "sound_selected_file", "notify.wav") or "").strip()
+            ssf = Path(ssf).name
+            if not ssf.lower().endswith(".wav"):
+                ssf = "notify.wav"
+            cfg.sound_selected_file = ssf or "notify.wav"
+        except Exception:
+            cfg.sound_selected_file = "notify.wav"
         return cfg
     except Exception:
         return BridgeConfig()
@@ -489,6 +507,9 @@ class BridgeConfig:
     # 屏幕最多同时可见弹窗数；超额进入 ui_pop_queue 排队，关闭后依次弹出（不再丢弃弹窗）
     max_pop_notification: int = 3
     notification_auto_close_seconds: int = 8
+    sound_enable: bool = True
+    sound_volume: int = 80
+    sound_selected_file: str = "notify.wav"
     auto_backup_enable: bool = False
     auto_backup_path: str = ""
     privacy_show_title: bool = True
@@ -959,6 +980,14 @@ class BridgeManager:
 
         if not payload.get("notif_id"):
             payload["notif_id"] = f"nk-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
+
+        # 去重通过后的全新通知：本进程播放 wav（读 sound_helper 内存运行时配置）
+        try:
+            from sound_helper import play_notify_wav
+
+            play_notify_wav(log=self.log)
+        except Exception as e:
+            self.log(f"[sound] play skipped: {e}")
 
         try:
             self._forward(payload)

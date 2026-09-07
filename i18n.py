@@ -177,6 +177,31 @@ DICT: Dict[str, Dict[str, str]] = {
         "en": "Auto-close must be an integer between 3 and 120 seconds.",
         "ja": "自動表示時間は3〜120の整数秒で入力してください。",
     },
+    "misc_sound_enable": {
+        "zh": "启用通知提示音",
+        "en": "Enable notification sound",
+        "ja": "通知音を有効化",
+    },
+    "misc_sound_file": {
+        "zh": "提示音音效文件:",
+        "en": "Notification sound file:",
+        "ja": "通知音ファイル:",
+    },
+    "misc_sound_volume": {
+        "zh": "提示音音量",
+        "en": "Notification volume",
+        "ja": "通知音量",
+    },
+    "misc_sound_hint": {
+        "zh": "提示：将 .wav 放入 assets/sound/ 后重启可出现在下拉框；发声时音量合成器会出现 NekoLink 滑块",
+        "en": "Tip: Put .wav files in assets/sound/ and restart to list them; Volume Mixer shows NekoLink while playing.",
+        "ja": "assets/sound/ に .wav を入れ再起動すると一覧に出ます。再生中のみミキサーにNekoLinkが出ます。",
+    },
+    "misc_sound_deps_missing": {
+        "zh": "当前环境无可用音频后端，提示音已禁用。",
+        "en": "No audio backend available; notification sound disabled.",
+        "ja": "利用可能な音声バックエンドがなく、通知音は無効です。",
+    },
     "misc_auto_backup": {"zh": "开启自动备份通知", "en": "Enable auto backup", "ja": "自動バックアップを有効化"},
     "misc_auto_backup_hint": {
         "zh": "自动写入 CSV 备份文件，新消息实时追加。",

@@ -7,3 +7,7 @@ winotify>=1.1.0
 winrt-Windows.UI.Notifications>=3.2.0
 winrt-Windows.Data.Xml.Dom>=3.2.0
 pywin32>=306
+pycaw>=20240210
+comtypes>=1.4.0
+# 提示音优先 simpleaudio；Python 3.14 若无 wheel/需 MSVC 时自动回退 winmm（仍只播 wav）。
+# simpleaudio>=1.0.4

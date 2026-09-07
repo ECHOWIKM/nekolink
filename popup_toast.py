@@ -66,14 +66,17 @@ _PAD_X = 12
 _PAD_Y = 10
 
 _WIDTH = DEFAULT_NOTIFICATION_WIDTH
-_BAR_H = 32
+_BAR_H = 36
 _BAR_GAP = 8
 _CARD_GAP = 14
 _MARGIN = 20
 _AVATAR = 48  # 通知卡片左上角图标统一显示尺寸
 _PAD = _PAD_X
-_RADIUS = 12
-_SHADOW_PAD = 6
+_RADIUS = 16  # 通知卡片四周圆角
+_BAR_RADIUS = 12  # 「全部隐藏」按钮圆角
+_TOP_BAR_FONT_SIZE = 15  # 「全部隐藏」文字字号
+_SHADOW_PAD = 8
+_CARD_OUTLINE = (209, 213, 219)  # #d1d5db
 _DURATION_MS = 8000  # 默认 8 秒；运行时以 NotificationManager.duration_ms 为准
 _SLIDE_MS = 250
 _FADE_MS = 400
@@ -246,9 +249,17 @@ def _preview_msg(msg: str, max_chars: int) -> str:
 
 
 def _content_wrap_width(card_width: int) -> int:
-    """右侧文字列可用宽度：卡片内宽 - 左右内边距 - 头像 - 间距 - 安全边距。"""
-    # 内容区总宽约 card_width - 2*_SHADOW_PAD；文字列再减去头像与间距
-    return max(80, int(card_width) - _SHADOW_PAD * 2 - _PAD_X * 2 - _AVATAR - 12)
+    """右侧文字列可用宽度：扣除阴影垫层、圆角安全边距、内边距与头像。"""
+    corner_inset = max(8, _RADIUS - 4)
+    return max(
+        80,
+        int(card_width)
+        - _SHADOW_PAD * 2
+        - corner_inset * 2
+        - _PAD_X * 2
+        - _AVATAR
+        - 12,
+    )
 
 
 def _resolve_display_texts(
@@ -387,17 +398,8 @@ _last_sound_at = 0.0
 
 
 def _play_notify_sound() -> None:
-    global _last_sound_at
-    now = time.time()
-    if now - _last_sound_at < 0.6:
-        return
-    _last_sound_at = now
-    try:
-        import winsound
-
-        winsound.MessageBeep(winsound.MB_OK)
-    except Exception:
-        pass
+    """已废弃：提示音改由 sound_helper 本进程播放，不再 MessageBeep。"""
+    return
 
 
 def _parse_fields(body_text: str) -> dict:
@@ -439,30 +441,30 @@ def _make_card_image(
     content_w: int, content_h: int, outer_w: int
 ) -> Tuple[Optional["ImageTk.PhotoImage"], int, int, int, int]:
     """
-    绘制单层白色圆角卡片 + 外侧浅灰柔影（RGB 色键底 #010101，禁止黑底/黑阴影块）。
+    绘制单层白色圆角卡片 + 外侧浅灰柔影（RGB 色键底 #010101）。
+    content_h 为白色圆角区域高度（应已含内容四周安全边距）。
     返回 (photo, outer_w, outer_h, content_offset_x, content_offset_y)。
     """
     pad = _SHADOW_PAD
     card_w = max(40, outer_w - pad * 2)
     card_h = max(40, content_h)
-    # 阴影轻微右下偏移；外框加高，避免阴影被裁切
-    sh_x, sh_y = 2, 3
+    # 柔影右下偏移；浅灰禁止黑块/白垫层
+    sh_x, sh_y = 2, 6
     outer_h = card_h + pad * 2 + sh_y
     if Image is None or ImageDraw is None or ImageTk is None:
         return None, outer_w, outer_h, pad, pad
 
-    # 色键底 #010101（与 -transparentcolor 一致）；禁止白垫层，也禁止可见黑底
     key_rgb = (1, 1, 1)
     img = Image.new("RGB", (outer_w, outer_h), key_rgb)
     draw = ImageDraw.Draw(img)
 
-    # 浅灰柔影（约 8% 黑叠在浅底上的观感）；禁止 #000 / #333 实心黑块
+    # 浅灰柔影
     draw.rounded_rectangle(
         [pad + sh_x, pad + sh_y, pad + sh_x + card_w - 1, pad + sh_y + card_h - 1],
         radius=_RADIUS,
-        fill=(210, 212, 216),
+        fill=(224, 226, 230),
     )
-    # 唯一白色圆角卡片（四角一致）
+    # 唯一白色圆角卡片（四角 radius=16）
     draw.rounded_rectangle(
         [pad, pad, pad + card_w - 1, pad + card_h - 1],
         radius=_RADIUS,
@@ -471,7 +473,7 @@ def _make_card_image(
     draw.rounded_rectangle(
         [pad, pad, pad + card_w - 1, pad + card_h - 1],
         radius=_RADIUS,
-        outline=(220, 223, 228),
+        outline=_CARD_OUTLINE,
         width=1,
     )
     return ImageTk.PhotoImage(img), outer_w, outer_h, pad, pad
@@ -540,7 +542,7 @@ def _load_avatar(app_name: str, icon_path: str, cache: dict) -> Optional[tk.Phot
 
 
 class _HideAllBar:
-    """白色通栏，文字始终蓝色 #2382dd。"""
+    """四周圆角的「全部隐藏」栏（PIL 圆角图 + 色键透明，禁止直角白底）。"""
 
     _BAR_TEXT = "全部隐藏"
     _BAR_FG = "#2382dd"
@@ -549,10 +551,52 @@ class _HideAllBar:
         self.root = root
         self._on_click = on_click
         self.win: Optional[tk.Toplevel] = None
-        self._frame: Optional[tk.Frame] = None
-        self._canvas: Optional[tk.Canvas] = None
-        self._text_id: Optional[int] = None
+        self._lbl: Optional[tk.Label] = None
+        self._photo_normal: Optional[tk.PhotoImage] = None
+        self._photo_hover: Optional[tk.PhotoImage] = None
         self._bar_width = DEFAULT_NOTIFICATION_WIDTH
+
+    def _render_bar_photo(self, width: int, fill_rgb: Tuple[int, int, int]) -> Optional[tk.PhotoImage]:
+        if Image is None or ImageDraw is None or ImageTk is None:
+            return None
+        h = _BAR_H
+        key_rgb = (1, 1, 1)
+        img = Image.new("RGB", (width, h), key_rgb)
+        draw = ImageDraw.Draw(img)
+        draw.rounded_rectangle(
+            [0, 0, width - 1, h - 1],
+            radius=_BAR_RADIUS,
+            fill=fill_rgb,
+        )
+        draw.rounded_rectangle(
+            [0, 0, width - 1, h - 1],
+            radius=_BAR_RADIUS,
+            outline=_CARD_OUTLINE,
+            width=1,
+        )
+        font = None
+        if ImageFont is not None:
+            for fp in ("C:/Windows/Fonts/msyh.ttc", "C:/Windows/Fonts/msyh.ttf", "C:/Windows/Fonts/segoeui.ttf"):
+                try:
+                    font = ImageFont.truetype(fp, _TOP_BAR_FONT_SIZE)
+                    break
+                except Exception:
+                    pass
+            if font is None:
+                try:
+                    font = ImageFont.load_default()
+                except Exception:
+                    font = None
+        if font is not None:
+            bbox = draw.textbbox((0, 0), self._BAR_TEXT, font=font)
+            tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+            draw.text(
+                ((width - tw) / 2, (h - th) / 2 - 1),
+                self._BAR_TEXT,
+                fill=self._BAR_FG,
+                font=font,
+            )
+        return ImageTk.PhotoImage(img)
 
     def _ensure(self, width: int) -> None:
         if self.win and self.win.winfo_exists() and self._bar_width == width:
@@ -564,56 +608,46 @@ class _HideAllBar:
         self.win.withdraw()
         self.win.overrideredirect(True)
         self.win.attributes("-topmost", True)
-        self.win.configure(bg="#ffffff")
+        self.win.configure(bg=_TRANSPARENT)
+        try:
+            self.win.attributes("-transparentcolor", _TRANSPARENT)
+        except tk.TclError:
+            pass
         self.win.geometry(f"{width}x{_BAR_H}")
-        self._frame = tk.Frame(self.win, bg="#ffffff", width=width, height=_BAR_H)
-        self._frame.pack(fill=tk.BOTH, expand=True)
-        self._frame.pack_propagate(False)
-        self._canvas = tk.Canvas(
-            self._frame,
-            width=width,
-            height=_BAR_H,
-            bg="#ffffff",
-            highlightthickness=0,
+
+        self._photo_normal = self._render_bar_photo(width, (255, 255, 255))
+        self._photo_hover = self._render_bar_photo(width, (245, 247, 250))
+
+        self._lbl = tk.Label(
+            self.win,
+            image=self._photo_normal,
+            bg=_TRANSPARENT,
             bd=0,
+            highlightthickness=0,
             cursor="hand2",
         )
-        self._canvas.pack(fill=tk.BOTH, expand=True)
-        self._text_id = self._canvas.create_text(
-            width // 2,
-            _BAR_H // 2,
-            text=self._BAR_TEXT,
-            fill=self._BAR_FG,
-            font=("Segoe UI", 9),
-            anchor=tk.CENTER,
-        )
-        self._canvas.bind("<Button-1>", lambda _e: self._on_click())
-        self._frame.bind("<Button-1>", lambda _e: self._on_click())
+        if self._photo_normal is not None:
+            self._lbl.configure(image=self._photo_normal)
+            self._lbl.image = self._photo_normal
+        self._lbl.pack()
+        self._lbl.bind("<Button-1>", lambda _e: self._on_click())
 
         def _enter(_e=None):
-            if self._frame and self._canvas:
-                self._frame.configure(bg=_CLR_BAR_HOVER)
-                self._canvas.configure(bg=_CLR_BAR_HOVER)
-                if self._text_id is not None:
-                    self._canvas.itemconfigure(self._text_id, fill=self._BAR_FG)
+            if self._lbl is not None and self._photo_hover is not None:
+                self._lbl.configure(image=self._photo_hover)
+                self._lbl.image = self._photo_hover
 
         def _leave(_e=None):
-            if self._frame and self._canvas:
-                self._frame.configure(bg="#ffffff")
-                self._canvas.configure(bg="#ffffff")
-                if self._text_id is not None:
-                    self._canvas.itemconfigure(self._text_id, fill=self._BAR_FG)
+            if self._lbl is not None and self._photo_normal is not None:
+                self._lbl.configure(image=self._photo_normal)
+                self._lbl.image = self._photo_normal
 
-        self._frame.bind("<Enter>", _enter)
-        self._frame.bind("<Leave>", _leave)
-        self._canvas.bind("<Enter>", _enter)
-        self._canvas.bind("<Leave>", _leave)
+        self._lbl.bind("<Enter>", _enter)
+        self._lbl.bind("<Leave>", _leave)
 
     def show_at(self, x: int, y: int, width: int) -> None:
         self._ensure(width)
         assert self.win is not None
-        if self._canvas is not None and self._text_id is not None:
-            self._canvas.itemconfigure(self._text_id, fill=self._BAR_FG)
         self.win.geometry(f"{width}x{_BAR_H}+{x}+{y}")
         self.win.deiconify()
         self.win.lift()
@@ -625,9 +659,9 @@ class _HideAllBar:
             except tk.TclError:
                 pass
             self.win = None
-            self._frame = None
-            self._canvas = None
-            self._text_id = None
+            self._lbl = None
+            self._photo_normal = None
+            self._photo_hover = None
 
 
 class CustomToastNotification:
@@ -659,8 +693,10 @@ class CustomToastNotification:
         self.outer_h = 90
         self.target_x = 0
         self.target_y = 0
-        # 白色卡片内容宽（扣除阴影垫层）
-        content_w = max(80, self.card_width - _SHADOW_PAD * 2)
+        # 圆角安全边距：白底内容矩形不得盖住四角圆弧
+        corner_inset = max(8, _RADIUS - 4)
+        # 内容布局宽度 = 白卡片内宽 - 两侧安全边距
+        content_w = max(80, self.card_width - _SHADOW_PAD * 2 - corner_inset * 2)
 
         self.win = tk.Toplevel(self.root)
         self.win.withdraw()
@@ -677,15 +713,20 @@ class CustomToastNotification:
         self._shell.pack()
 
         self._bg_lbl = tk.Label(self._shell, bd=0, highlightthickness=0, bg=_TRANSPARENT)
-        # 内容层白底：勿用色键 #010101，否则色键未生效时整块显黑
-        inner_frame = tk.Frame(self._shell, bg="#ffffff", width=content_w, bd=0, highlightthickness=0)
+        # 内容白底 Frame：尺寸小于圆角白卡片，四周留给圆弧
+        inner_frame = tk.Frame(
+            self._shell, bg="#ffffff", width=content_w, bd=0, highlightthickness=0
+        )
         inner_frame.pack_propagate(True)
         self._build_content(inner_frame, app_name, title_text, msg_text, meta)
 
         inner_frame.update_idletasks()
         content_h = max(inner_frame.winfo_reqheight(), 1)
-
-        photo, ow, oh, ox, oy = _make_card_image(content_w, content_h, self.card_width)
+        # 白卡片高度 = 内容 + 上下圆角安全边距，保证直角内容盖不到四角
+        card_h = content_h + corner_inset * 2
+        card_w = content_w + corner_inset * 2
+        # outer 宽仍用 notification_width；白区居中于阴影垫层内
+        photo, ow, oh, ox, oy = _make_card_image(card_w, card_h, self.card_width)
         self.outer_w = ow
         self.outer_h = oh
         self._bg_photo = photo
@@ -693,13 +734,16 @@ class CustomToastNotification:
             self._bg_lbl.configure(image=photo)
             self._bg_lbl.image = photo
         self._bg_lbl.pack()
-        # 内容相对白卡片内缩，减轻白底盖住圆角
-        inset = 3
+        # 内容置于白卡片内侧（ox/oy 为白卡片左上角）
+        white_w = max(40, self.card_width - _SHADOW_PAD * 2)
+        # 水平居中内容于白卡片
+        place_x = ox + max(0, (white_w - content_w) // 2)
+        place_y = oy + corner_inset
         inner_frame.place(
-            x=ox + inset,
-            y=oy + inset,
-            width=max(1, content_w - inset * 2),
-            height=max(1, content_h - inset * 2),
+            x=place_x,
+            y=place_y,
+            width=content_w,
+            height=content_h,
         )
 
         self._bind_hover(self.win)
@@ -1059,7 +1103,7 @@ class NotificationManager:
         icon_path: str = "",
         notif_id: str = "",
         body_text: str = "",
-        play_sound: bool = True,
+        play_sound: bool = False,
         app_bundle_id: str = "",
         device_name: str = "",
         timestamp: str = "",
@@ -1117,7 +1161,8 @@ class NotificationManager:
             self._items.append(toast)
 
         if payload.get("play_sound"):
-            _play_notify_sound()
+            # 已禁用：提示音统一由 sound_helper.play_notify_wav 处理，禁止 MessageBeep/双重发声
+            pass
 
         self._layout(slide=toast)
         return toast

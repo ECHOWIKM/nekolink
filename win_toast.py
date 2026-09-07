@@ -251,7 +251,7 @@ def _build_toast_xml(app_name: str, title: str, msg: str, icon_path: str) -> str
         f"{texts}\n"
         "    </binding>\n"
         "  </visual>\n"
-        '  <audio src="ms-winsoundevent:Notification.Default"/>\n'
+        '  <audio silent="true"/>\n'
         "</toast>"
     )
 
@@ -375,7 +375,7 @@ def _show_via_winotify(
             icon=icon,
             duration="long",
         )
-        toast.set_audio(audio.Default, loop=False)
+        toast.set_audio(audio.Silent, loop=False)
         toast.show()
         return True
     except Exception as e:
