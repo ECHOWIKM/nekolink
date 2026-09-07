@@ -36,6 +36,7 @@ from popup_toast import (
     POPUP_POSITION_LABELS,
     normalize_notification_width,
     normalize_notification_font_size,
+    normalize_max_preview_chars,
     NOTIFICATION_WIDTH_LABELS,
     NOTIFICATION_FONT_LABELS,
 )
@@ -69,9 +70,10 @@ class App(tb.Window):
             on_click=self.open_history_for_notif,
             popup_position=getattr(self.cfg, "popup_position", "bottom_right"),
             notification_width=getattr(self.cfg, "notification_width", 420),
-            notification_font_size=getattr(self.cfg, "notification_font_size", 8),
+            notification_font_size=getattr(self.cfg, "notification_font_size", 10),
             privacy_show_title=getattr(self.cfg, "privacy_show_title", True),
             privacy_show_msg=getattr(self.cfg, "privacy_show_msg", True),
+            max_preview_chars=getattr(self.cfg, "max_preview_chars", 50),
         )
         self.manager = BridgeManager(
             self.cfg,
@@ -284,6 +286,8 @@ class App(tb.Window):
             ))
             self.cmb_notif_width.configure(values=width_values)
             self.var_notif_width.set(self._notif_width_label_from_key(cur_width))
+        if "lbl_max_preview" in self.ui:
+            self.ui["lbl_max_preview"].config(text=i18n.t("misc_max_preview"))
         if hasattr(self, "privacy_frm"):
             self.privacy_frm.configure(text=i18n.t("privacy_title"))
         if "chk_privacy_show_title" in self.ui:
@@ -755,7 +759,7 @@ class App(tb.Window):
         self.ui["lbl_notif_font"] = tb.Label(font_row, text="通知字体大小")
         self.ui["lbl_notif_font"].pack(side=LEFT, padx=(0, 8))
         self.var_notif_font = tk.StringVar(
-            value=self._notif_font_label_from_key(getattr(self.cfg, "notification_font_size", 8))
+            value=self._notif_font_label_from_key(getattr(self.cfg, "notification_font_size", 10))
         )
         font_values = [self._notif_font_label_from_key(k) for k in self._notif_font_keys]
         # 去重，防止下拉出现重复「默认」项
@@ -788,13 +792,30 @@ class App(tb.Window):
         )
         self.cmb_notif_width.pack(side=LEFT)
 
+        preview_row = tb.Frame(frm)
+        preview_row.pack(fill=X, anchor=W, pady=(0, 3))
+        self.ui["lbl_max_preview"] = tb.Label(preview_row, text="消息最大预览字数：")
+        self.ui["lbl_max_preview"].pack(side=LEFT, padx=(0, 8))
+        self.var_max_preview = tk.StringVar(
+            value=str(normalize_max_preview_chars(getattr(self.cfg, "max_preview_chars", 50)))
+        )
+        self.ent_max_preview = tb.Entry(preview_row, textvariable=self.var_max_preview, width=8)
+        self.ent_max_preview.pack(side=LEFT)
+
+        def _normalize_preview_entry():
+            val = normalize_max_preview_chars(self.var_max_preview.get())
+            self.var_max_preview.set(str(val))
+            return val
+
         def _sync_popup_ui_settings(_evt=None):
+            preview_chars = _normalize_preview_entry()
             self.popup_toast.apply_ui_settings(
                 popup_position=self._popup_pos_key_from_label(self.var_popup_pos.get()),
                 notification_font_size=self._notif_font_key_from_label(self.var_notif_font.get()),
                 notification_width=self._notif_width_key_from_label(self.var_notif_width.get()),
                 privacy_show_title=bool(self.var_privacy_show_title.get()),
                 privacy_show_msg=bool(self.var_privacy_show_msg.get()),
+                max_preview_chars=preview_chars,
             )
             if self.running and self.manager:
                 self.manager.cfg.popup_position = self._popup_pos_key_from_label(self.var_popup_pos.get())
@@ -806,10 +827,13 @@ class App(tb.Window):
                 )
                 self.manager.cfg.privacy_show_title = bool(self.var_privacy_show_title.get())
                 self.manager.cfg.privacy_show_msg = bool(self.var_privacy_show_msg.get())
+                self.manager.cfg.max_preview_chars = preview_chars
 
         self.cmb_popup_pos.bind("<<ComboboxSelected>>", _sync_popup_ui_settings)
         self.cmb_notif_font.bind("<<ComboboxSelected>>", _sync_popup_ui_settings)
         self.cmb_notif_width.bind("<<ComboboxSelected>>", _sync_popup_ui_settings)
+        self.ent_max_preview.bind("<FocusOut>", _sync_popup_ui_settings)
+        self.ent_max_preview.bind("<Return>", _sync_popup_ui_settings)
 
         self.privacy_frm = tb.Labelframe(frm, text="隐私设置", padding=6)
         self.privacy_frm.pack(fill=X, anchor=W, pady=(4, 4))
@@ -1237,7 +1261,7 @@ class App(tb.Window):
         for key in (6, 8, 10, 12):
             if i18n.t(NOTIFICATION_FONT_LABELS[key]) == label:
                 return key
-        return normalize_notification_font_size(getattr(self.cfg, "notification_font_size", 8))
+        return normalize_notification_font_size(getattr(self.cfg, "notification_font_size", 10))
 
     def _notif_width_label_from_key(self, key) -> str:
         key = normalize_notification_width(key)
@@ -1254,9 +1278,10 @@ class App(tb.Window):
         self.popup_toast.apply_ui_settings(
             popup_position=getattr(cfg, "popup_position", "bottom_right"),
             notification_width=getattr(cfg, "notification_width", 420),
-            notification_font_size=getattr(cfg, "notification_font_size", 8),
+            notification_font_size=getattr(cfg, "notification_font_size", 10),
             privacy_show_title=getattr(cfg, "privacy_show_title", True),
             privacy_show_msg=getattr(cfg, "privacy_show_msg", True),
+            max_preview_chars=getattr(cfg, "max_preview_chars", 50),
         )
 
     def clear_history(self):
@@ -1512,6 +1537,7 @@ class App(tb.Window):
             popup_position=self._popup_pos_key_from_label(self.var_popup_pos.get()),
             notification_width=self._notif_width_key_from_label(self.var_notif_width.get()),
             notification_font_size=self._notif_font_key_from_label(self.var_notif_font.get()),
+            max_preview_chars=normalize_max_preview_chars(self.var_max_preview.get()),
             privacy_show_title=bool(self.var_privacy_show_title.get()),
             privacy_show_msg=bool(self.var_privacy_show_msg.get()),
 

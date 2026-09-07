@@ -37,10 +37,12 @@ _CLR_BAR_HOVER = "#f5f7fa"
 # 默认尺寸与隐私
 NOTIFICATION_WIDTH = 420
 DEFAULT_NOTIFICATION_WIDTH = 420
-NOTIFICATION_FONT_SIZE = 8
-DEFAULT_NOTIFICATION_FONT_SIZE = 8
+NOTIFICATION_FONT_SIZE = 10
+DEFAULT_NOTIFICATION_FONT_SIZE = 10
 PRIVACY_SHOW_TITLE = True
 PRIVACY_SHOW_MSG = True
+DEFAULT_MAX_PREVIEW_CHARS = 50
+MAX_PREVIEW_CHARS = 50
 
 VALID_NOTIFICATION_WIDTHS = frozenset({300, 420, 480, 540})
 VALID_NOTIFICATION_FONT_SIZES = frozenset({6, 8, 10, 12})
@@ -132,14 +134,33 @@ def normalize_notification_font_size(size) -> int:
         return DEFAULT_NOTIFICATION_FONT_SIZE
     if s in VALID_NOTIFICATION_FONT_SIZES:
         return s
-    # 旧档位 14/16/18 迁移到 12；其它回落到默认 8
+    # 旧档位 14/16/18 迁移到 12；其它回落到默认 10
     if s in (14, 16, 18):
         return 12
     return DEFAULT_NOTIFICATION_FONT_SIZE
 
 
+def normalize_max_preview_chars(n) -> int:
+    try:
+        v = int(n)
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_PREVIEW_CHARS
+    if v <= 0:
+        return DEFAULT_MAX_PREVIEW_CHARS
+    return v
+
+
+def _preview_msg(msg: str, max_chars: int) -> str:
+    msg = msg or ""
+    limit = normalize_max_preview_chars(max_chars)
+    if len(msg) > limit:
+        return msg[:limit] + "…"
+    return msg
+
+
 def _content_wrap_width(card_width: int) -> int:
-    return max(80, card_width - _AVATAR - _PAD_X * 3 - 16)
+    # 内容区宽度：弹窗宽 - 左右内边距 - 头像 - 间距
+    return max(80, int(card_width) - 24 - _AVATAR - 10)
 
 
 def _resolve_display_texts(
@@ -167,82 +188,79 @@ def _make_title_msg_line(
     privacy_show_msg: bool,
     font_size: int,
     card_width: int,
+    max_preview_chars: int = DEFAULT_MAX_PREVIEW_CHARS,
 ) -> Optional[tk.Misc]:
     """
-    行内双色渲染。
-    Windows 透明窗体下 tk.Label 的 foreground 会被吞成黑色，改用 Canvas.create_text
-    保证 #2382dd 生效；逻辑仍按双色分支：title 蓝加粗 / msg 灰。
+    上下分行排版（禁止 side=left 并排）：
+    第1行 title 蓝色加粗；第2行 msg 灰色自动换行。
+    title 继续用 Canvas.create_text(fill="#2382dd")，避免透明窗体下 Label 丢色。
     """
     display_title, display_msg, single_blue = _resolve_display_texts(
         title, msg, privacy_show_title, privacy_show_msg
     )
+    # 仅对真实消息正文做预览截断；隐私占位文案不截断
+    if privacy_show_title and privacy_show_msg and display_msg:
+        display_msg = _preview_msg(display_msg, max_preview_chars)
+
     wrap_w = _content_wrap_width(card_width)
     title_font = (_FONT_FAMILY, font_size, "bold")
     body_font = (_FONT_FAMILY, font_size)
 
-    line_frame = tk.Frame(parent, bg="#ffffff", bd=0, highlightthickness=0)
-    line_frame.pack(anchor="w", fill=tk.X, pady=(2, 0))
+    block = tk.Frame(parent, bg="#ffffff", bd=0, highlightthickness=0)
+    block.pack(anchor="w", fill=tk.X, pady=(2, 0))
 
-    canvas = tk.Canvas(
-        line_frame,
-        bg="#ffffff",
-        highlightthickness=0,
-        bd=0,
-        relief=tk.FLAT,
-    )
-    canvas.pack(anchor="w")
+    def _title_canvas(text: str) -> tk.Canvas:
+        cv = tk.Canvas(block, bg="#ffffff", highlightthickness=0, bd=0, relief=tk.FLAT)
+        cv.pack(anchor="w", fill=tk.X)
+        tid = cv.create_text(
+            0,
+            0,
+            text=text,
+            fill="#2382dd",
+            font=title_font,
+            anchor="nw",
+            width=wrap_w,
+        )
+        bbox = cv.bbox(tid)
+        if bbox:
+            cv.configure(width=wrap_w, height=max(1, bbox[3] - bbox[1] + 2))
+        else:
+            cv.configure(width=wrap_w, height=font_size + 6)
+        return cv
 
-    def _measure(text: str, font) -> Tuple[int, int]:
-        tid = canvas.create_text(0, 0, text=text, font=font, anchor="nw")
-        bbox = canvas.bbox(tid)
-        canvas.delete(tid)
-        if not bbox:
-            return 0, font_size + 4
-        return bbox[2] - bbox[0], bbox[3] - bbox[1]
+    def _msg_label(text: str) -> tk.Label:
+        lbl = tk.Label(
+            block,
+            text=text,
+            fg="#333333",
+            foreground="#333333",
+            font=body_font,
+            bg="#ffffff",
+            bd=0,
+            highlightthickness=0,
+            relief=tk.FLAT,
+            anchor="w",
+            justify=tk.LEFT,
+            wraplength=wrap_w,
+        )
+        lbl.pack(anchor="w", fill=tk.X, pady=(2, 0))
+        return lbl
 
     if single_blue or not privacy_show_title:
-        text = "您有一条新消息"
-        tw, th = _measure(text, title_font)
-        canvas.configure(width=max(wrap_w, tw + 2), height=th + 2)
-        canvas.create_text(
-            0, 0, text=text, fill="#2382dd", font=title_font, anchor="nw", width=wrap_w
-        )
-        return line_frame
+        _title_canvas("您有一条新消息")
+        return block
 
     if not display_title and not display_msg:
-        line_frame.destroy()
+        block.destroy()
         return None
 
-    x = 0
-    y = 0
-    max_h = font_size + 4
-    total_w = 0
-
     if display_title:
-        tw, th = _measure(display_title, title_font)
-        canvas.create_text(x, y, text=display_title, fill="#2382dd", font=title_font, anchor="nw")
-        x += tw
-        max_h = max(max_h, th)
-        total_w = x
+        _title_canvas(display_title)
 
     if display_msg:
-        msg_text = f": {display_msg}" if display_title else display_msg
-        # 剩余宽度用于换行
-        remain = max(40, wrap_w - x)
-        mw, mh = _measure(msg_text, body_font)
-        tid = canvas.create_text(
-            x, y, text=msg_text, fill="#333333", font=body_font, anchor="nw", width=remain
-        )
-        bbox = canvas.bbox(tid)
-        if bbox:
-            max_h = max(max_h, bbox[3] - bbox[1])
-            total_w = max(total_w, bbox[2])
-        else:
-            total_w = max(total_w, x + mw)
-            max_h = max(max_h, mh)
+        _msg_label(display_msg)
 
-    canvas.configure(width=min(wrap_w + 4, max(total_w + 2, 40)), height=max_h + 2)
-    return line_frame
+    return block
 
 
 def _get_work_area(root: Optional[tk.Misc] = None) -> Tuple[int, int, int, int]:
@@ -596,6 +614,7 @@ class CustomToastNotification:
             self.manager.privacy_show_msg,
             self.font_size,
             self.card_width,
+            max_preview_chars=self.manager.max_preview_chars,
         )
 
         if meta:
@@ -760,6 +779,7 @@ class NotificationManager:
     NOTIFICATION_FONT_SIZE = NOTIFICATION_FONT_SIZE
     PRIVACY_SHOW_TITLE = PRIVACY_SHOW_TITLE
     PRIVACY_SHOW_MSG = PRIVACY_SHOW_MSG
+    MAX_PREVIEW_CHARS = MAX_PREVIEW_CHARS
 
     def __init__(
         self,
@@ -772,6 +792,7 @@ class NotificationManager:
         notification_font_size: int = DEFAULT_NOTIFICATION_FONT_SIZE,
         privacy_show_title: bool = True,
         privacy_show_msg: bool = True,
+        max_preview_chars: int = DEFAULT_MAX_PREVIEW_CHARS,
     ):
         self.root = root
         self.on_click = on_click
@@ -782,6 +803,7 @@ class NotificationManager:
         self.notification_font_size = normalize_notification_font_size(notification_font_size)
         self.privacy_show_title = bool(privacy_show_title)
         self.privacy_show_msg = bool(privacy_show_msg)
+        self.max_preview_chars = normalize_max_preview_chars(max_preview_chars)
         self._items: List[CustomToastNotification] = []
         self._icon_cache: dict = {}
         self._hide_bar = _HideAllBar(root, self.dismiss_all)
@@ -794,6 +816,7 @@ class NotificationManager:
         notification_font_size: Optional[int] = None,
         privacy_show_title: Optional[bool] = None,
         privacy_show_msg: Optional[bool] = None,
+        max_preview_chars: Optional[int] = None,
     ) -> None:
         if popup_position is not None:
             self.popup_position = normalize_popup_position(popup_position)
@@ -805,6 +828,8 @@ class NotificationManager:
             self.privacy_show_title = bool(privacy_show_title)
         if privacy_show_msg is not None:
             self.privacy_show_msg = bool(privacy_show_msg)
+        if max_preview_chars is not None:
+            self.max_preview_chars = normalize_max_preview_chars(max_preview_chars)
         if self._items:
             try:
                 self.root.after(0, lambda: self._layout(slide=None))

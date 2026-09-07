@@ -156,6 +156,7 @@ DICT: Dict[str, Dict[str, str]] = {
     "misc_notif_width_md": {"zh": "默认 (420)", "en": "Default (420)", "ja": "標準 (420)"},
     "misc_notif_width_lg": {"zh": "大 (480)", "en": "Large (480)", "ja": "大 (480)"},
     "misc_notif_width_xl": {"zh": "超大 (540)", "en": "Extra large (540)", "ja": "特大 (540)"},
+    "misc_max_preview": {"zh": "消息最大预览字数：", "en": "Max preview chars:", "ja": "プレビュー最大文字数："},
     "privacy_title": {"zh": "隐私设置", "en": "Privacy", "ja": "プライバシー"},
     "privacy_show_title": {
         "zh": "显示通知标题（发件人/会话标题）",

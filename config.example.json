@@ -46,7 +46,8 @@
   "enable_windows_toast": true,
   "popup_position": "bottom_right",
   "notification_width": 420,
-  "notification_font_size": 8,
+  "notification_font_size": 10,
+  "max_preview_chars": 50,
   "privacy_show_title": true,
   "privacy_show_msg": true,
   "push_template": "设备：{device}\n【{app}】\n标题：{title}\n内容：{msg}\n时间：{date}\n电量：{battery}"

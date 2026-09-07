@@ -464,7 +464,8 @@ class BridgeConfig:
     enable_windows_toast: bool = True
     popup_position: str = "bottom_right"
     notification_width: int = 420
-    notification_font_size: int = 8
+    notification_font_size: int = 10
+    max_preview_chars: int = 50
     privacy_show_title: bool = True
     privacy_show_msg: bool = True
 
