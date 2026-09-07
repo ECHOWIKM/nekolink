@@ -1,9 +1,12 @@
 # app_gui.py
+import csv
 import os
 import queue
+import sys
 import threading
 import time
 import tkinter as tk
+from pathlib import Path
 from tkinter import messagebox, filedialog
 from typing import Optional
 from ttkbootstrap.scrolled import ScrolledFrame
@@ -37,12 +40,41 @@ from popup_toast import (
     normalize_notification_width,
     normalize_notification_font_size,
     normalize_max_preview_chars,
+    normalize_max_pop_notification,
+    normalize_notification_auto_close_seconds,
+    parse_notification_auto_close_seconds,
     NOTIFICATION_WIDTH_LABELS,
     NOTIFICATION_FONT_LABELS,
 )
 
 CONFIG_PATH = get_config_path()
 ICON_PATH = "icon.ico"
+
+# ---------------------------------------------------------------------------
+# 历史消息内存 / 磁盘评估（注释说明，非自动备份业务）
+# 场景：约 1 分钟 50 条推送 → 1 小时约 3000 条。
+# 内存：单条几十~200 字符，3000 条仅数 MB，压力很小；但若无限保留几十万条会持续上涨。
+# 磁盘：单条 csv/json 约 150 字节；50 条/分钟 ≈ 7.5KB/分；1 小时 ≈ 450KB；全天约 10MB 级。
+# 保护：① 内存历史上限 MAX_HISTORY_COUNT，超限丢弃最旧；② 自动备份可选，默认关闭。
+# ---------------------------------------------------------------------------
+MAX_HISTORY_COUNT = 2000
+_HISTORY_CSV_HEADER = ["时间", "设备", "APP名称", "APP包名", "通知标题", "通知内容"]
+
+
+def _app_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def _backup_dir() -> Path:
+    d = _app_dir() / "backup"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _default_auto_backup_path() -> Path:
+    return _backup_dir() / "notification_auto_backup.csv"
 
 
 class App(tb.Window):
@@ -60,7 +92,8 @@ class App(tb.Window):
         self.minsize(980, 620)
 
         self.running = False
-        self.history = []  # list of payload dict
+        # 内存历史列表（供导出）；上限 MAX_HISTORY_COUNT，超限丢弃最旧
+        self.history = []
         self._hist_raw: dict = {}  # tree iid -> {"app": bundle_id, "device": mac, "notif_id": ...}
         self._notif_to_iid: dict = {}
         self._map_icon_paths: dict = {}
@@ -74,6 +107,10 @@ class App(tb.Window):
             privacy_show_title=getattr(self.cfg, "privacy_show_title", True),
             privacy_show_msg=getattr(self.cfg, "privacy_show_msg", True),
             max_preview_chars=getattr(self.cfg, "max_preview_chars", 50),
+            max_pop_notification=getattr(self.cfg, "max_pop_notification", 3),
+            notification_auto_close_seconds=getattr(
+                self.cfg, "notification_auto_close_seconds", 8
+            ),
         )
         self.manager = BridgeManager(
             self.cfg,
@@ -81,6 +118,12 @@ class App(tb.Window):
             self.on_notification,
             on_desktop_popup=self._show_desktop_popup,
         )
+
+        # 启动即确保 backup 目录存在
+        try:
+            _backup_dir()
+        except Exception as e:
+            print(f"[backup] mkdir failed: {e}")
 
         icon_path = ICON_PATH if os.path.exists(ICON_PATH) else None
         self.tray = TrayController(
@@ -277,7 +320,11 @@ class App(tb.Window):
                 [self._notif_font_label_from_key(k) for k in self._notif_font_keys]
             ))
             self.cmb_notif_font.configure(values=font_values)
-            self.var_notif_font.set(self._notif_font_label_from_key(cur_font))
+            label = self._notif_font_label_from_key(cur_font)
+            self.cmb_notif_font.set(label)
+            self.var_notif_font.set(label)
+        if "lbl_notif_font_restart" in self.ui:
+            self.ui["lbl_notif_font_restart"].config(text=i18n.t("misc_restart_hint"))
         self.ui["lbl_notif_width"].config(text=i18n.t("misc_notif_width"))
         if hasattr(self, "cmb_notif_width"):
             cur_width = self._notif_width_key_from_label(self.var_notif_width.get())
@@ -286,8 +333,19 @@ class App(tb.Window):
             ))
             self.cmb_notif_width.configure(values=width_values)
             self.var_notif_width.set(self._notif_width_label_from_key(cur_width))
+        if "lbl_notif_width_restart" in self.ui:
+            self.ui["lbl_notif_width_restart"].config(text=i18n.t("misc_restart_hint"))
         if "lbl_max_preview" in self.ui:
             self.ui["lbl_max_preview"].config(text=i18n.t("misc_max_preview"))
+        if "lbl_max_pop" in self.ui:
+            self.ui["lbl_max_pop"].config(text=i18n.t("misc_max_pop"))
+        if "lbl_auto_close" in self.ui:
+            self.ui["lbl_auto_close"].config(text=i18n.t("misc_auto_close"))
+            self.ui["lbl_auto_close_hint"].config(text=i18n.t("misc_auto_close_hint"))
+        if "chk_auto_backup" in self.ui:
+            self.ui["chk_auto_backup"].config(text=i18n.t("misc_auto_backup"))
+            self.ui["lbl_auto_backup_hint"].config(text=i18n.t("misc_auto_backup_hint"))
+            self.ui["lbl_auto_backup_path"].config(text=i18n.t("misc_auto_backup_path"))
         if hasattr(self, "privacy_frm"):
             self.privacy_frm.configure(text=i18n.t("privacy_title"))
         if "chk_privacy_show_title" in self.ui:
@@ -301,6 +359,8 @@ class App(tb.Window):
         self.ui["lbl_history_title"].config(text=i18n.t("history_title"))
         self.ui["btn_clear_history"].config(text=i18n.t("clear"))
         self.ui["btn_copy_history"].config(text=i18n.t("copy_selected"))
+        if "btn_export_history" in self.ui:
+            self.ui["btn_export_history"].config(text=i18n.t("history_export_all"))
         self.ui["lbl_logs_title"].config(text=i18n.t("tab_logs"))
         self.ui["btn_clear_logs"].config(text=i18n.t("clear"))
 
@@ -758,12 +818,15 @@ class App(tb.Window):
         self._notif_font_keys = [6, 8, 10, 12]
         self.ui["lbl_notif_font"] = tb.Label(font_row, text="通知字体大小")
         self.ui["lbl_notif_font"].pack(side=LEFT, padx=(0, 8))
-        self.var_notif_font = tk.StringVar(
-            value=self._notif_font_label_from_key(getattr(self.cfg, "notification_font_size", 10))
+        # 先读 config 数值，再创建 Combobox，并 set 选中文本
+        _font_size_cfg = normalize_notification_font_size(
+            getattr(self.cfg, "notification_font_size", 10)
         )
-        font_values = [self._notif_font_label_from_key(k) for k in self._notif_font_keys]
-        # 去重，防止下拉出现重复「默认」项
-        font_values = list(dict.fromkeys(font_values))
+        _font_label_cfg = self._notif_font_label_from_key(_font_size_cfg)
+        self.var_notif_font = tk.StringVar(value=_font_label_cfg)
+        font_values = list(
+            dict.fromkeys([self._notif_font_label_from_key(k) for k in self._notif_font_keys])
+        )
         self.cmb_notif_font = tb.Combobox(
             font_row,
             textvariable=self.var_notif_font,
@@ -772,6 +835,16 @@ class App(tb.Window):
             width=14,
         )
         self.cmb_notif_font.pack(side=LEFT)
+        self.cmb_notif_font.set(_font_label_cfg)
+        self.var_notif_font.set(_font_label_cfg)
+        self.ui["lbl_notif_font_restart"] = tb.Label(
+            font_row, text="修改后需要重启程序生效", bootstyle="secondary"
+        )
+        self.ui["lbl_notif_font_restart"].pack(side=LEFT, padx=(8, 0))
+        print(
+            f"[UI] notification_font_size={_font_size_cfg}, "
+            f"combobox={self.cmb_notif_font.get()!r}"
+        )
 
         width_row = tb.Frame(frm)
         width_row.pack(fill=X, anchor=W, pady=(0, 3))
@@ -791,6 +864,10 @@ class App(tb.Window):
             width=14,
         )
         self.cmb_notif_width.pack(side=LEFT)
+        self.ui["lbl_notif_width_restart"] = tb.Label(
+            width_row, text="修改后需要重启程序生效", bootstyle="secondary"
+        )
+        self.ui["lbl_notif_width_restart"].pack(side=LEFT, padx=(8, 0))
 
         preview_row = tb.Frame(frm)
         preview_row.pack(fill=X, anchor=W, pady=(0, 3))
@@ -802,6 +879,75 @@ class App(tb.Window):
         self.ent_max_preview = tb.Entry(preview_row, textvariable=self.var_max_preview, width=8)
         self.ent_max_preview.pack(side=LEFT)
 
+        self.ui["lbl_max_pop"] = tb.Label(
+            frm,
+            text="屏幕最多同时可见弹窗数量；超额消息排队，关闭现有弹窗后自动继续弹出。",
+            wraplength=520,
+            justify=LEFT,
+        )
+        self.ui["lbl_max_pop"].pack(anchor=W, pady=(0, 2))
+        pop_row = tb.Frame(frm)
+        pop_row.pack(fill=X, anchor=W, pady=(0, 3))
+        self.var_max_pop = tk.IntVar(
+            value=normalize_max_pop_notification(getattr(self.cfg, "max_pop_notification", 3))
+        )
+        self.ui["lbl_max_pop_val"] = tb.Label(pop_row, text=str(self.var_max_pop.get()), width=3)
+        self.ui["lbl_max_pop_val"].pack(side=LEFT, padx=(0, 8))
+        self.scl_max_pop = tb.Scale(
+            pop_row,
+            from_=1,
+            to=10,
+            orient=HORIZONTAL,
+            length=180,
+            command=lambda v: self._on_max_pop_scale(v),
+        )
+        self.scl_max_pop.set(self.var_max_pop.get())
+        self.scl_max_pop.pack(side=LEFT, fill=X, expand=True)
+
+        close_row = tb.Frame(frm)
+        close_row.pack(fill=X, anchor=W, pady=(0, 1))
+        self.ui["lbl_auto_close"] = tb.Label(close_row, text="通知弹窗自动显示时长(秒)")
+        self.ui["lbl_auto_close"].pack(side=LEFT, padx=(0, 8))
+        self.var_auto_close = tk.StringVar(
+            value=str(
+                normalize_notification_auto_close_seconds(
+                    getattr(self.cfg, "notification_auto_close_seconds", 8)
+                )
+            )
+        )
+        self.ent_auto_close = tb.Entry(close_row, textvariable=self.var_auto_close, width=8)
+        self.ent_auto_close.pack(side=LEFT)
+        self.ui["lbl_auto_close_hint"] = tb.Label(
+            frm,
+            text="范围3‑120秒，到时间弹窗自动关闭",
+            bootstyle="secondary",
+            wraplength=520,
+            justify=LEFT,
+        )
+        self.ui["lbl_auto_close_hint"].pack(anchor=W, pady=(0, 3))
+
+        backup_frm = tb.Frame(frm)
+        backup_frm.pack(fill=X, anchor=W, pady=(2, 3))
+        self.var_auto_backup = tk.BooleanVar(value=bool(getattr(self.cfg, "auto_backup_enable", False)))
+        self.ui["chk_auto_backup"] = tb.Checkbutton(
+            backup_frm,
+            text="开启自动备份通知",
+            variable=self.var_auto_backup,
+            bootstyle="round-toggle",
+        )
+        self.ui["chk_auto_backup"].pack(anchor=W)
+        self.ui["lbl_auto_backup_hint"] = tb.Label(
+            backup_frm, text="", bootstyle="secondary", wraplength=520, justify=LEFT
+        )
+        self.ui["lbl_auto_backup_hint"].pack(anchor=W, pady=(0, 2))
+        path_row = tb.Frame(backup_frm)
+        path_row.pack(fill=X, anchor=W)
+        self.ui["lbl_auto_backup_path"] = tb.Label(path_row, text="备份文件路径（留空用默认）")
+        self.ui["lbl_auto_backup_path"].pack(side=LEFT, padx=(0, 8))
+        self.var_auto_backup_path = tk.StringVar(value=str(getattr(self.cfg, "auto_backup_path", "") or ""))
+        self.ent_auto_backup_path = tb.Entry(path_row, textvariable=self.var_auto_backup_path)
+        self.ent_auto_backup_path.pack(side=LEFT, fill=X, expand=True)
+
         def _normalize_preview_entry():
             val = normalize_max_preview_chars(self.var_max_preview.get())
             self.var_max_preview.set(str(val))
@@ -809,6 +955,9 @@ class App(tb.Window):
 
         def _sync_popup_ui_settings(_evt=None):
             preview_chars = _normalize_preview_entry()
+            max_pop = normalize_max_pop_notification(self.var_max_pop.get())
+            self.var_max_pop.set(max_pop)
+            self.ui["lbl_max_pop_val"].config(text=str(max_pop))
             self.popup_toast.apply_ui_settings(
                 popup_position=self._popup_pos_key_from_label(self.var_popup_pos.get()),
                 notification_font_size=self._notif_font_key_from_label(self.var_notif_font.get()),
@@ -816,6 +965,7 @@ class App(tb.Window):
                 privacy_show_title=bool(self.var_privacy_show_title.get()),
                 privacy_show_msg=bool(self.var_privacy_show_msg.get()),
                 max_preview_chars=preview_chars,
+                max_pop_notification=max_pop,
             )
             if self.running and self.manager:
                 self.manager.cfg.popup_position = self._popup_pos_key_from_label(self.var_popup_pos.get())
@@ -828,12 +978,17 @@ class App(tb.Window):
                 self.manager.cfg.privacy_show_title = bool(self.var_privacy_show_title.get())
                 self.manager.cfg.privacy_show_msg = bool(self.var_privacy_show_msg.get())
                 self.manager.cfg.max_preview_chars = preview_chars
+                self.manager.cfg.max_pop_notification = max_pop
+                self.manager.cfg.auto_backup_enable = bool(self.var_auto_backup.get())
+                self.manager.cfg.auto_backup_path = self.var_auto_backup_path.get().strip()
 
         self.cmb_popup_pos.bind("<<ComboboxSelected>>", _sync_popup_ui_settings)
         self.cmb_notif_font.bind("<<ComboboxSelected>>", _sync_popup_ui_settings)
         self.cmb_notif_width.bind("<<ComboboxSelected>>", _sync_popup_ui_settings)
         self.ent_max_preview.bind("<FocusOut>", _sync_popup_ui_settings)
         self.ent_max_preview.bind("<Return>", _sync_popup_ui_settings)
+        self.var_auto_backup.trace_add("write", lambda *_: _sync_popup_ui_settings())
+        self.ent_auto_backup_path.bind("<FocusOut>", _sync_popup_ui_settings)
 
         self.privacy_frm = tb.Labelframe(frm, text="隐私设置", padding=6)
         self.privacy_frm.pack(fill=X, anchor=W, pady=(4, 4))
@@ -887,6 +1042,10 @@ class App(tb.Window):
 
         self.ui["btn_clear_history"] = tb.Button(top, text="", bootstyle="warning", command=self.clear_history)
         self.ui["btn_clear_history"].pack(side=RIGHT, padx=(8, 0))
+        self.ui["btn_export_history"] = tb.Button(
+            top, text="导出全部历史消息", bootstyle="info", command=self.export_all_history
+        )
+        self.ui["btn_export_history"].pack(side=RIGHT, padx=(8, 0))
         self.ui["btn_copy_history"] = tb.Button(top, text="", bootstyle="secondary", command=self.copy_selected_history)
         self.ui["btn_copy_history"].pack(side=RIGHT)
 
@@ -1129,6 +1288,21 @@ class App(tb.Window):
 
         t = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(payload["ts"]))
         codes = " ".join(payload.get("codes") or [])
+
+        # 写入内存历史（导出用），超限丢弃最旧
+        hist_row = {
+            "time": t,
+            "device": device_name,
+            "app_name": app_name,
+            "app_bundle": app_raw,
+            "title": payload.get("title") or "",
+            "msg": payload.get("msg") or "",
+        }
+        self.history.append(hist_row)
+        while len(self.history) > MAX_HISTORY_COUNT:
+            self.history.pop(0)
+        self._append_auto_backup_row(hist_row)
+
         iid = self.tree.insert(
             "", "end",
             values=(t, device_name, bat_text, app_name,
@@ -1143,7 +1317,7 @@ class App(tb.Window):
         if nid:
             self._notif_to_iid[nid] = iid
 
-        # prune
+        # prune tree UI（与主页「历史条数上限」同步；内存列表另有 MAX_HISTORY_COUNT 保护）
         limit = int(self.safe_int(self.var_history_limit.get(), default=self.cfg.history_limit))
         children = self.tree.get_children()
         if len(children) > max(50, limit):
@@ -1157,15 +1331,86 @@ class App(tb.Window):
     def on_save(self):
         self._persist_config(show_msg=True)
 
+    def reload_runtime_config(self, cfg: Optional[BridgeConfig] = None) -> bool:
+        """
+        热加载 A 类配置到运行时内存：
+        屏蔽关键词、icon 映射、预览字数、最大弹窗数、自动备份等。
+        不重置历史、不销毁已弹出卡片；字号/宽度保持进程内原值（需重启）。
+        """
+        old_cfg = self.cfg
+        try:
+            if cfg is None:
+                cfg = load_config(CONFIG_PATH)
+            self.cfg = cfg
+            if self.manager is not None:
+                self.manager.apply_runtime_config(cfg)
+
+            # 直接写 A 类字段，避免 apply_ui_settings 触发已有弹窗 re-layout
+            self.popup_toast.max_preview_chars = normalize_max_preview_chars(
+                getattr(cfg, "max_preview_chars", 50)
+            )
+            self.popup_toast.max_visible = normalize_max_pop_notification(
+                getattr(cfg, "max_pop_notification", 3)
+            )
+            secs = normalize_notification_auto_close_seconds(
+                getattr(cfg, "notification_auto_close_seconds", 8)
+            )
+            self.popup_toast.duration_ms = secs * 1000
+            # 上限调高时立刻从排队队列补弹
+            try:
+                self.popup_toast.drain_ui_pop_queue()
+            except Exception:
+                pass
+            # 清 icon 缓存，下一条新通知用新映射；已弹出卡片不刷新
+            try:
+                self.popup_toast._icon_cache.clear()
+            except Exception:
+                pass
+
+            self.log(
+                "[CONFIG] hot-reload ok: "
+                f"keywords={len(cfg.block_keywords or [])}, "
+                f"icons={len(cfg.app_icon_map or {})}, "
+                f"max_pop={getattr(cfg, 'max_pop_notification', 3)}, "
+                f"preview={getattr(cfg, 'max_preview_chars', 50)}, "
+                f"auto_close={secs}s"
+            )
+            return True
+        except Exception as e:
+            self.cfg = old_cfg
+            if self.manager is not None:
+                try:
+                    self.manager.apply_runtime_config(old_cfg)
+                except Exception:
+                    pass
+            self.log(f"[CONFIG] hot-reload failed, keep previous runtime config: {e}")
+            return False
+
     def _persist_config(self, show_msg: bool = True):
+        secs, err = parse_notification_auto_close_seconds(
+            self.var_auto_close.get() if hasattr(self, "var_auto_close") else "8"
+        )
+        if err or secs is None:
+            if show_msg:
+                messagebox.showwarning(i18n.t("missing"), i18n.t("misc_auto_close_invalid"))
+                return
+            secs = normalize_notification_auto_close_seconds(
+                getattr(self.cfg, "notification_auto_close_seconds", 8)
+            )
+        self.var_auto_close.set(str(secs))
         cfg = self.collect_config()
         save_config(CONFIG_PATH, cfg)
-        self.cfg = cfg
-        self.manager.cfg = cfg
-        self._sync_popup_toast_from_cfg(cfg)
+        ok = self.reload_runtime_config(cfg)
+        # 刷新映射表 UI 显示（不重建历史列表）
         self._reload_app_map_tree()
         if show_msg:
-            messagebox.showinfo(i18n.t("ok"), f"{i18n.t('saved_to')}\n{CONFIG_PATH}")
+            if ok:
+                messagebox.showinfo(i18n.t("ok"), f"{i18n.t('saved_hot_reload')}\n{CONFIG_PATH}")
+            else:
+                messagebox.showwarning(
+                    i18n.t("fail"),
+                    f"{i18n.t('saved_to')}\n{CONFIG_PATH}\n(热加载失败，请查看日志)",
+                )
 
     def on_start(self):
         if self.running:
@@ -1174,7 +1419,8 @@ class App(tb.Window):
         cfg = self.collect_config()
         save_config(CONFIG_PATH, cfg)
         self.cfg = cfg
-        self.manager.cfg = cfg
+        self.manager.apply_runtime_config(cfg)
+        # 启动时完整同步弹窗参数（含字号/宽度）
         self._sync_popup_toast_from_cfg(cfg)
 
         addrs = cfg.ble_addresses or []
@@ -1254,7 +1500,7 @@ class App(tb.Window):
 
     def _notif_font_label_from_key(self, key) -> str:
         key = normalize_notification_font_size(key)
-        return i18n.t(NOTIFICATION_FONT_LABELS.get(key, "misc_notif_font_sm"))
+        return i18n.t(NOTIFICATION_FONT_LABELS.get(key, "misc_notif_font_md"))
 
     def _notif_font_key_from_label(self, label: str) -> int:
         label = (label or "").strip()
@@ -1274,6 +1520,46 @@ class App(tb.Window):
                 return key
         return normalize_notification_width(getattr(self.cfg, "notification_width", 420))
 
+    def _on_max_pop_scale(self, value) -> None:
+        n = normalize_max_pop_notification(float(value))
+        self.var_max_pop.set(n)
+        if "lbl_max_pop_val" in self.ui:
+            self.ui["lbl_max_pop_val"].config(text=str(n))
+        self.popup_toast.apply_ui_settings(max_pop_notification=n)
+        if self.running and self.manager:
+            self.manager.cfg.max_pop_notification = n
+
+    def _resolve_auto_backup_path(self) -> Path:
+        custom = (self.var_auto_backup_path.get() if hasattr(self, "var_auto_backup_path") else "") or ""
+        custom = custom.strip()
+        if custom:
+            return Path(custom)
+        return _default_auto_backup_path()
+
+    def _append_auto_backup_row(self, row: dict) -> None:
+        if not hasattr(self, "var_auto_backup") or not bool(self.var_auto_backup.get()):
+            return
+        try:
+            path = self._resolve_auto_backup_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            write_header = not path.exists() or path.stat().st_size == 0
+            with open(path, "a", encoding="utf-8-sig", newline="") as f:
+                writer = csv.writer(f)
+                if write_header:
+                    writer.writerow(_HISTORY_CSV_HEADER)
+                writer.writerow(
+                    [
+                        row.get("time", ""),
+                        row.get("device", ""),
+                        row.get("app_name", ""),
+                        row.get("app_bundle", ""),
+                        row.get("title", ""),
+                        row.get("msg", ""),
+                    ]
+                )
+        except Exception as e:
+            self.log(f"[backup] auto append failed: {e}")
+
     def _sync_popup_toast_from_cfg(self, cfg) -> None:
         self.popup_toast.apply_ui_settings(
             popup_position=getattr(cfg, "popup_position", "bottom_right"),
@@ -1282,6 +1568,10 @@ class App(tb.Window):
             privacy_show_title=getattr(cfg, "privacy_show_title", True),
             privacy_show_msg=getattr(cfg, "privacy_show_msg", True),
             max_preview_chars=getattr(cfg, "max_preview_chars", 50),
+            max_pop_notification=getattr(cfg, "max_pop_notification", 3),
+            notification_auto_close_seconds=getattr(
+                cfg, "notification_auto_close_seconds", 8
+            ),
         )
 
     def clear_history(self):
@@ -1289,6 +1579,40 @@ class App(tb.Window):
             self.tree.delete(iid)
         self._hist_raw.clear()
         self._notif_to_iid.clear()
+        self.history.clear()
+        try:
+            self.popup_toast.clear_ui_pop_queue()
+        except Exception:
+            pass
+
+    def export_all_history(self):
+        """手动导出内存中的历史列表为 CSV（写入 backup/，不覆盖旧文件）。"""
+        if not self.history:
+            messagebox.showwarning(i18n.t("missing"), i18n.t("history_export_empty"))
+            return
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        out_path = _backup_dir() / f"history_{stamp}.csv"
+        try:
+            with open(out_path, "w", encoding="utf-8-sig", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(_HISTORY_CSV_HEADER)
+                for row in self.history:
+                    writer.writerow(
+                        [
+                            row.get("time", ""),
+                            row.get("device", ""),
+                            row.get("app_name", ""),
+                            row.get("app_bundle", ""),
+                            row.get("title", ""),
+                            row.get("msg", ""),
+                        ]
+                    )
+            messagebox.showinfo(
+                i18n.t("ok"),
+                f"{i18n.t('history_export_ok')}\n{out_path}",
+            )
+        except Exception as e:
+            messagebox.showerror(i18n.t("fail"), f"{i18n.t('history_export_fail')}\n{e}")
 
     def _show_desktop_popup(
         self,
@@ -1538,6 +1862,12 @@ class App(tb.Window):
             notification_width=self._notif_width_key_from_label(self.var_notif_width.get()),
             notification_font_size=self._notif_font_key_from_label(self.var_notif_font.get()),
             max_preview_chars=normalize_max_preview_chars(self.var_max_preview.get()),
+            max_pop_notification=normalize_max_pop_notification(self.var_max_pop.get()),
+            notification_auto_close_seconds=normalize_notification_auto_close_seconds(
+                self.var_auto_close.get() if hasattr(self, "var_auto_close") else 8
+            ),
+            auto_backup_enable=bool(self.var_auto_backup.get()),
+            auto_backup_path=self.var_auto_backup_path.get().strip(),
             privacy_show_title=bool(self.var_privacy_show_title.get()),
             privacy_show_msg=bool(self.var_privacy_show_msg.get()),
 

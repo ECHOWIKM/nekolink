@@ -11,7 +11,8 @@ import time
 import tkinter as tk
 import ctypes
 from ctypes import wintypes
-from typing import Callable, List, Optional, Tuple
+from collections import deque
+from typing import Callable, Deque, List, Optional, Tuple
 
 try:
     from PIL import Image, ImageDraw, ImageFont, ImageTk
@@ -69,13 +70,67 @@ _BAR_H = 32
 _BAR_GAP = 8
 _CARD_GAP = 14
 _MARGIN = 20
-_AVATAR = 44
+_AVATAR = 48  # 通知卡片左上角图标统一显示尺寸
 _PAD = _PAD_X
-_RADIUS = 10
-_DURATION_MS = 5000
+_RADIUS = 12
+_SHADOW_PAD = 6
+_DURATION_MS = 8000  # 默认 8 秒；运行时以 NotificationManager.duration_ms 为准
 _SLIDE_MS = 250
 _FADE_MS = 400
-_MAX_VISIBLE = 3
+# 屏幕最多同时可见弹窗数量（超额进入 ui_pop_queue 排队，关闭后依次弹出）
+DEFAULT_MAX_POP_NOTIFICATION = 3
+MAX_POP_NOTIFICATION = 3
+# ui_pop_queue 兜底上限（与历史内存上限量级一致，防异常堆积）
+_UI_POP_QUEUE_MAX = 2000
+
+DEFAULT_AUTO_CLOSE_SECONDS = 8
+MIN_AUTO_CLOSE_SECONDS = 3
+MAX_AUTO_CLOSE_SECONDS = 120
+
+
+def _lanczos_resample():
+    """高质量抗锯齿插值；禁止 NEAREST。"""
+    if Image is None:
+        return None
+    try:
+        return Image.Resampling.LANCZOS
+    except AttributeError:
+        return getattr(Image, "LANCZOS", Image.BICUBIC)
+
+
+def _remove_white_edge(img):
+    """弱化半透明白边/白点，不过度处理实心白色内容。"""
+    if img is None or img.mode != "RGBA":
+        return img
+    try:
+        data = img.getdata()
+        new_data = []
+        for r, g, b, a in data:
+            if r > 240 and g > 240 and b > 240 and a < 180:
+                new_data.append((r, g, b, 0))
+            else:
+                new_data.append((r, g, b, a))
+        img.putdata(new_data)
+    except Exception:
+        pass
+    return img
+
+
+def _fit_icon_on_white(src, size: int):
+    """
+    等比例 LANCZOS 缩放 → 居中到 size×size 透明画布 → alpha 合成到白底。
+    消除透明杂边/白点；禁止拉伸变形与 NEAREST。
+    """
+    img = src.convert("RGBA") if src.mode != "RGBA" else src.copy()
+    img.thumbnail((size, size), _lanczos_resample())
+    canvas = Image.new("RGBA", (size, size), (255, 255, 255, 0))
+    paste_x = (size - img.width) // 2
+    paste_y = (size - img.height) // 2
+    canvas.paste(img, (paste_x, paste_y), mask=img)
+    canvas = _remove_white_edge(canvas)
+    white_bg = Image.new("RGBA", (size, size), (255, 255, 255, 255))
+    return Image.alpha_composite(white_bg, canvas)
+
 
 # 可选值："top_left", "bottom_left", "top_right", "bottom_right"
 POPUP_POSITION = "bottom_right"
@@ -150,6 +205,38 @@ def normalize_max_preview_chars(n) -> int:
     return v
 
 
+def normalize_max_pop_notification(n) -> int:
+    try:
+        v = int(n)
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_POP_NOTIFICATION
+    return max(1, min(10, v))
+
+
+def normalize_notification_auto_close_seconds(n) -> int:
+    """弹窗自动关闭秒数，钳位到 3–120；非法输入回退默认 8。"""
+    try:
+        v = int(str(n).strip())
+    except (TypeError, ValueError):
+        return DEFAULT_AUTO_CLOSE_SECONDS
+    return max(MIN_AUTO_CLOSE_SECONDS, min(MAX_AUTO_CLOSE_SECONDS, v))
+
+
+def parse_notification_auto_close_seconds(raw) -> Tuple[Optional[int], Optional[str]]:
+    """
+    解析用户输入的自动关闭秒数。
+    返回 (seconds, error)：非整数时 seconds=None 且 error 有文案；越界则钳位后返回。
+    """
+    s = str(raw if raw is not None else "").strip()
+    if not s or not re.fullmatch(r"-?\d+", s):
+        return None, "invalid"
+    try:
+        v = int(s)
+    except (TypeError, ValueError):
+        return None, "invalid"
+    return normalize_notification_auto_close_seconds(v), None
+
+
 def _preview_msg(msg: str, max_chars: int) -> str:
     msg = msg or ""
     limit = normalize_max_preview_chars(max_chars)
@@ -159,8 +246,9 @@ def _preview_msg(msg: str, max_chars: int) -> str:
 
 
 def _content_wrap_width(card_width: int) -> int:
-    # 内容区宽度：弹窗宽 - 左右内边距 - 头像 - 间距
-    return max(80, int(card_width) - 24 - _AVATAR - 10)
+    """右侧文字列可用宽度：卡片内宽 - 左右内边距 - 头像 - 间距 - 安全边距。"""
+    # 内容区总宽约 card_width - 2*_SHADOW_PAD；文字列再减去头像与间距
+    return max(80, int(card_width) - _SHADOW_PAD * 2 - _PAD_X * 2 - _AVATAR - 12)
 
 
 def _resolve_display_texts(
@@ -210,16 +298,25 @@ def _make_title_msg_line(
     block.pack(anchor="w", fill=tk.X, pady=(2, 0))
 
     def _title_canvas(text: str) -> tk.Canvas:
-        cv = tk.Canvas(block, bg="#ffffff", highlightthickness=0, bd=0, relief=tk.FLAT)
-        cv.pack(anchor="w", fill=tk.X)
+        cv = tk.Canvas(
+            block,
+            bg="#ffffff",
+            highlightthickness=0,
+            bd=0,
+            relief=tk.FLAT,
+            width=wrap_w,
+        )
+        cv.pack(anchor="w")
+        # 左右各留 1px，避免末字被 Canvas 裁切
+        text_w = max(40, wrap_w - 2)
         tid = cv.create_text(
-            0,
+            1,
             0,
             text=text,
             fill="#2382dd",
             font=title_font,
             anchor="nw",
-            width=wrap_w,
+            width=text_w,
         )
         bbox = cv.bbox(tid)
         if bbox:
@@ -241,7 +338,7 @@ def _make_title_msg_line(
             relief=tk.FLAT,
             anchor="w",
             justify=tk.LEFT,
-            wraplength=wrap_w,
+            wraplength=max(40, wrap_w - 2),
         )
         lbl.pack(anchor="w", fill=tk.X, pady=(2, 0))
         return lbl
@@ -339,53 +436,102 @@ def _compose_message(payload: dict) -> Tuple[str, str, str, str]:
 
 
 def _make_card_image(
-    inner_w: int, inner_h: int, canvas_w: int
-) -> Tuple[Optional["ImageTk.PhotoImage"], int, int]:
+    content_w: int, content_h: int, outer_w: int
+) -> Tuple[Optional["ImageTk.PhotoImage"], int, int, int, int]:
+    """
+    绘制单层白色圆角卡片 + 外侧浅灰柔影（RGB 色键底 #010101，禁止黑底/黑阴影块）。
+    返回 (photo, outer_w, outer_h, content_offset_x, content_offset_y)。
+    """
+    pad = _SHADOW_PAD
+    card_w = max(40, outer_w - pad * 2)
+    card_h = max(40, content_h)
+    # 阴影轻微右下偏移；外框加高，避免阴影被裁切
+    sh_x, sh_y = 2, 3
+    outer_h = card_h + pad * 2 + sh_y
     if Image is None or ImageDraw is None or ImageTk is None:
-        return None, canvas_w, inner_h + 8
-    oh = inner_h + 8
-    canvas_h = oh + 5
-    img = Image.new("RGBA", (canvas_w, canvas_h), (1, 1, 1, 0))
+        return None, outer_w, outer_h, pad, pad
+
+    # 色键底 #010101（与 -transparentcolor 一致）；禁止白垫层，也禁止可见黑底
+    key_rgb = (1, 1, 1)
+    img = Image.new("RGB", (outer_w, outer_h), key_rgb)
     draw = ImageDraw.Draw(img)
-    ex, ey = inner_w, oh
-    draw.rounded_rectangle([2, 3, ex + 2, ey + 3], radius=_RADIUS, fill=(0, 0, 0, 30))
-    draw.rounded_rectangle([0, 0, ex, ey], radius=_RADIUS, fill=(255, 255, 255, 255))
-    draw.rounded_rectangle([0, 0, ex, ey], radius=_RADIUS, outline=(220, 223, 228, 255), width=1)
-    return ImageTk.PhotoImage(img), canvas_w, canvas_h
+
+    # 浅灰柔影（约 8% 黑叠在浅底上的观感）；禁止 #000 / #333 实心黑块
+    draw.rounded_rectangle(
+        [pad + sh_x, pad + sh_y, pad + sh_x + card_w - 1, pad + sh_y + card_h - 1],
+        radius=_RADIUS,
+        fill=(210, 212, 216),
+    )
+    # 唯一白色圆角卡片（四角一致）
+    draw.rounded_rectangle(
+        [pad, pad, pad + card_w - 1, pad + card_h - 1],
+        radius=_RADIUS,
+        fill=(255, 255, 255),
+    )
+    draw.rounded_rectangle(
+        [pad, pad, pad + card_w - 1, pad + card_h - 1],
+        radius=_RADIUS,
+        outline=(220, 223, 228),
+        width=1,
+    )
+    return ImageTk.PhotoImage(img), outer_w, outer_h, pad, pad
 
 
 def _load_avatar(app_name: str, icon_path: str, cache: dict) -> Optional[tk.PhotoImage]:
-    key = f"{icon_path or app_name}:{_AVATAR}"
+    """
+    Pillow：RGBA + thumbnail(LANCZOS) 等比例缩放 → 居中 → 白底 alpha_composite。
+    禁止 tk subsample/zoom / NEAREST；结果固定 size×size，避免撑大卡片。
+    """
+    size = _AVATAR
+    key = f"{icon_path or app_name}:{size}:thumb-white-v2"
     if key in cache:
         return cache[key]
+
     img = None
-    if icon_path and os.path.isfile(icon_path) and Image is not None:
+    if icon_path and os.path.isfile(icon_path) and Image is not None and ImageTk is not None:
         try:
-            src = Image.open(icon_path).convert("RGBA").resize((_AVATAR, _AVATAR), Image.Resampling.LANCZOS)
-            mask = Image.new("L", (_AVATAR, _AVATAR), 0)
-            ImageDraw.Draw(mask).ellipse((0, 0, _AVATAR - 1, _AVATAR - 1), fill=255)
-            img = Image.new("RGBA", (_AVATAR, _AVATAR), (0, 0, 0, 0))
-            img.paste(src, (0, 0), mask)
-        except Exception:
+            src = Image.open(icon_path).convert("RGBA")
+            img = _fit_icon_on_white(src, size)
+        except Exception as e:
+            print(f"[toast] icon load failed ({icon_path}): {e}")
             img = None
-    if img is None and Image is not None:
-        letter = (app_name or "?").strip()[:1] or "?"
-        idx = sum(ord(c) for c in app_name) % len(_AVATAR_COLORS)
-        img = Image.new("RGBA", (_AVATAR, _AVATAR), (0, 0, 0, 0))
-        draw = ImageDraw.Draw(img)
-        draw.ellipse((0, 0, _AVATAR - 1, _AVATAR - 1), fill=_AVATAR_COLORS[idx])
-        font = None
-        for fp in ("C:/Windows/Fonts/msyh.ttc", "C:/Windows/Fonts/segoeui.ttf"):
-            try:
-                font = ImageFont.truetype(fp, 18)
-                break
-            except Exception:
-                pass
-        if font is None:
-            font = ImageFont.load_default()
-        bbox = draw.textbbox((0, 0), letter, font=font)
-        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-        draw.text(((_AVATAR - tw) / 2, (_AVATAR - th) / 2 - 1), letter, fill="white", font=font)
+
+    if img is None and Image is not None and ImageDraw is not None:
+        # 字母圆形头像：超采样后缩小，再合成到白底（与自定义图标流程一致）
+        try:
+            letter = (app_name or "?").strip()[:1] or "?"
+            idx = sum(ord(c) for c in (app_name or "")) % len(_AVATAR_COLORS)
+            color = _AVATAR_COLORS[idx]
+            scale = 4
+            big = size * scale
+            canvas = Image.new("RGBA", (big, big), (0, 0, 0, 0))
+            draw = ImageDraw.Draw(canvas)
+            draw.ellipse((0, 0, big - 1, big - 1), fill=color)
+            font = None
+            font_px = max(20, int(big * 0.42))
+            for fp in ("C:/Windows/Fonts/msyh.ttc", "C:/Windows/Fonts/segoeui.ttf"):
+                try:
+                    font = ImageFont.truetype(fp, font_px)
+                    break
+                except Exception:
+                    pass
+            if font is None:
+                font = ImageFont.load_default()
+            bbox = draw.textbbox((0, 0), letter, font=font)
+            tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+            draw.text(
+                ((big - tw) / 2, (big - th) / 2 - big * 0.02),
+                letter,
+                fill="white",
+                font=font,
+            )
+            letter_rgba = canvas.resize((size, size), _lanczos_resample())
+            white_bg = Image.new("RGBA", (size, size), (255, 255, 255, 255))
+            img = Image.alpha_composite(white_bg, letter_rgba)
+        except Exception as e:
+            print(f"[toast] letter avatar failed: {e}")
+            img = None
+
     if img is None or ImageTk is None:
         return None
     photo = ImageTk.PhotoImage(img)
@@ -507,11 +653,14 @@ class CustomToastNotification:
         self._fading = False
         self._timer: Optional[str] = None
         self._shown_at = time.time()
+        # 创建时快照时长：热加载只影响后续新卡片，已弹出卡片沿用本值
+        self.duration_ms = max(1000, int(getattr(manager, "duration_ms", _DURATION_MS) or _DURATION_MS))
         self.outer_w = self.card_width
         self.outer_h = 90
         self.target_x = 0
         self.target_y = 0
-        inner_content_w = self.card_width - 8
+        # 白色卡片内容宽（扣除阴影垫层）
+        content_w = max(80, self.card_width - _SHADOW_PAD * 2)
 
         self.win = tk.Toplevel(self.root)
         self.win.withdraw()
@@ -524,27 +673,34 @@ class CustomToastNotification:
         except tk.TclError:
             pass
 
-        self._shell = tk.Frame(self.win, bg=_TRANSPARENT)
+        self._shell = tk.Frame(self.win, bg=_TRANSPARENT, bd=0, highlightthickness=0)
         self._shell.pack()
 
-        self._bg_lbl = tk.Label(self._shell, bd=0, bg=_TRANSPARENT)
-        inner_frame = tk.Frame(self._shell, bg="#ffffff", width=inner_content_w)
+        self._bg_lbl = tk.Label(self._shell, bd=0, highlightthickness=0, bg=_TRANSPARENT)
+        # 内容层白底：勿用色键 #010101，否则色键未生效时整块显黑
+        inner_frame = tk.Frame(self._shell, bg="#ffffff", width=content_w, bd=0, highlightthickness=0)
         inner_frame.pack_propagate(True)
         self._build_content(inner_frame, app_name, title_text, msg_text, meta)
 
         inner_frame.update_idletasks()
-        # 高度完全由内容撑开，不写死固定 height
-        inner_h = max(inner_frame.winfo_reqheight(), 1)
+        content_h = max(inner_frame.winfo_reqheight(), 1)
 
-        photo, _cw, ch = _make_card_image(inner_content_w, inner_h, self.card_width)
-        self.outer_w = self.card_width
-        self.outer_h = ch
+        photo, ow, oh, ox, oy = _make_card_image(content_w, content_h, self.card_width)
+        self.outer_w = ow
+        self.outer_h = oh
         self._bg_photo = photo
         if photo:
             self._bg_lbl.configure(image=photo)
             self._bg_lbl.image = photo
         self._bg_lbl.pack()
-        inner_frame.place(x=0, y=4, width=inner_content_w, height=inner_h)
+        # 内容相对白卡片内缩，减轻白底盖住圆角
+        inset = 3
+        inner_frame.place(
+            x=ox + inset,
+            y=oy + inset,
+            width=max(1, content_w - inset * 2),
+            height=max(1, content_h - inset * 2),
+        )
 
         self._bind_hover(self.win)
         self._bind_hover(self._shell)
@@ -557,24 +713,39 @@ class CustomToastNotification:
         msg_text: str,
         meta: str,
     ) -> None:
-        inner = tk.Frame(parent, bg="#ffffff")
+        # 内容区强制白底，避免透出黑底
+        inner = tk.Frame(parent, bg="#ffffff", bd=0, highlightthickness=0)
         inner.pack(fill=tk.BOTH, expand=True, padx=_PAD_X, pady=_PAD_Y)
         meta_font_size = max(6, self.font_size - 2)
+        wrap_w = _content_wrap_width(self.card_width)
 
-        row = tk.Frame(inner, bg="#ffffff")
+        row = tk.Frame(inner, bg="#ffffff", bd=0, highlightthickness=0)
         row.pack(fill=tk.X)
 
-        av = tk.Label(row, bg="#ffffff", bd=0)
+        av = tk.Label(
+            row,
+            bg="#ffffff",
+            bd=0,
+            highlightthickness=0,
+            relief=tk.FLAT,
+            width=_AVATAR,
+            height=_AVATAR,
+        )
         av.pack(side=tk.LEFT, anchor=tk.N)
+        # 有图时用像素尺寸固定；禁止自动撑大
+        av.configure(width=_AVATAR, height=_AVATAR)
         photo = _load_avatar(app_name, self.payload.get("icon_path") or "", self.manager._icon_cache)
         if photo:
-            av.configure(image=photo)
+            av.configure(image=photo, width=_AVATAR, height=_AVATAR)
             av.image = photo
+            self._avatar_photo = photo
+        else:
+            self._avatar_photo = None
 
-        right = tk.Frame(row, bg="#ffffff")
+        right = tk.Frame(row, bg="#ffffff", bd=0, highlightthickness=0)
         right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(10, 0))
 
-        title_row = tk.Frame(right, bg="#ffffff")
+        title_row = tk.Frame(right, bg="#ffffff", bd=0, highlightthickness=0)
         title_row.pack(fill=tk.X)
 
         tk.Label(
@@ -587,6 +758,7 @@ class CustomToastNotification:
             anchor=tk.W,
             bd=0,
             highlightthickness=0,
+            wraplength=max(40, wrap_w - 20),
         ).pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         self._close = tk.Label(
@@ -628,7 +800,8 @@ class CustomToastNotification:
                 anchor=tk.W,
                 bd=0,
                 highlightthickness=0,
-            ).pack(fill=tk.X, pady=(3, 0))
+                wraplength=max(40, wrap_w - 2),
+            ).pack(anchor=tk.W, pady=(3, 0))
 
         self._bind_body_click(inner)
 
@@ -674,7 +847,7 @@ class CustomToastNotification:
             return
         self._cancel_timer()
         elapsed = (time.time() - self._shown_at) * 1000
-        remaining = max(500, int(_DURATION_MS - elapsed))
+        remaining = max(500, int(self.duration_ms - elapsed))
         self._timer = self.root.after(remaining, self._start_fade)
 
     def _start_fade(self) -> None:
@@ -780,24 +953,35 @@ class NotificationManager:
     PRIVACY_SHOW_TITLE = PRIVACY_SHOW_TITLE
     PRIVACY_SHOW_MSG = PRIVACY_SHOW_MSG
     MAX_PREVIEW_CHARS = MAX_PREVIEW_CHARS
+    MAX_POP_NOTIFICATION = MAX_POP_NOTIFICATION
 
     def __init__(
         self,
         root: tk.Misc,
         on_click: Optional[Callable[[str], None]] = None,
         duration_ms: int = _DURATION_MS,
-        max_visible: int = _MAX_VISIBLE,
+        max_visible: int = DEFAULT_MAX_POP_NOTIFICATION,
         popup_position: str = DEFAULT_POPUP_POSITION,
         notification_width: int = DEFAULT_NOTIFICATION_WIDTH,
         notification_font_size: int = DEFAULT_NOTIFICATION_FONT_SIZE,
         privacy_show_title: bool = True,
         privacy_show_msg: bool = True,
         max_preview_chars: int = DEFAULT_MAX_PREVIEW_CHARS,
+        max_pop_notification: Optional[int] = None,
+        notification_auto_close_seconds: Optional[int] = None,
     ):
         self.root = root
         self.on_click = on_click
-        self.duration_ms = duration_ms
-        self.max_visible = min(max_visible, _MAX_VISIBLE)
+        if notification_auto_close_seconds is not None:
+            secs = normalize_notification_auto_close_seconds(notification_auto_close_seconds)
+            self.duration_ms = secs * 1000
+        else:
+            self.duration_ms = max(1000, int(duration_ms or _DURATION_MS))
+        # max_pop_notification 优先；兼容旧参数 max_visible
+        pop_n = DEFAULT_MAX_POP_NOTIFICATION if max_pop_notification is None else max_pop_notification
+        if max_pop_notification is None and max_visible != DEFAULT_MAX_POP_NOTIFICATION:
+            pop_n = max_visible
+        self.max_visible = normalize_max_pop_notification(pop_n)
         self.popup_position = normalize_popup_position(popup_position)
         self.notification_width = normalize_notification_width(notification_width)
         self.notification_font_size = normalize_notification_font_size(notification_font_size)
@@ -805,8 +989,20 @@ class NotificationManager:
         self.privacy_show_msg = bool(privacy_show_msg)
         self.max_preview_chars = normalize_max_preview_chars(max_preview_chars)
         self._items: List[CustomToastNotification] = []
+        # 可视化弹窗等待队列（FIFO）；与 BLE notify_queue 无关，仅管界面展示
+        self._ui_pop_queue: Deque[dict] = deque()
+        self._suppress_queue_drain = 0
         self._icon_cache: dict = {}
         self._hide_bar = _HideAllBar(root, self.dismiss_all)
+
+    @property
+    def active_pop_count(self) -> int:
+        """当前屏幕上正在显示的弹窗卡片数量。"""
+        return len(self._items)
+
+    def clear_ui_pop_queue(self) -> None:
+        """清空弹窗等待队列（退出 / 清空历史 / 全部隐藏时调用）。"""
+        self._ui_pop_queue.clear()
 
     def apply_ui_settings(
         self,
@@ -817,6 +1013,8 @@ class NotificationManager:
         privacy_show_title: Optional[bool] = None,
         privacy_show_msg: Optional[bool] = None,
         max_preview_chars: Optional[int] = None,
+        max_pop_notification: Optional[int] = None,
+        notification_auto_close_seconds: Optional[int] = None,
     ) -> None:
         if popup_position is not None:
             self.popup_position = normalize_popup_position(popup_position)
@@ -830,9 +1028,23 @@ class NotificationManager:
             self.privacy_show_msg = bool(privacy_show_msg)
         if max_preview_chars is not None:
             self.max_preview_chars = normalize_max_preview_chars(max_preview_chars)
+        if notification_auto_close_seconds is not None:
+            # 只更新 Manager 默认时长；已创建卡片各自持有 duration_ms 快照，不受影响
+            secs = normalize_notification_auto_close_seconds(notification_auto_close_seconds)
+            self.duration_ms = secs * 1000
+        max_pop_changed = False
+        if max_pop_notification is not None:
+            self.max_visible = normalize_max_pop_notification(max_pop_notification)
+            max_pop_changed = True
         if self._items:
             try:
                 self.root.after(0, lambda: self._layout(slide=None))
+            except tk.TclError:
+                pass
+        # 提高同时可见上限时，立刻从排队队列补弹
+        if max_pop_changed:
+            try:
+                self.root.after(0, self.drain_ui_pop_queue)
             except tk.TclError:
                 pass
 
@@ -870,11 +1082,31 @@ class NotificationManager:
         except tk.TclError:
             pass
 
+    def _enqueue_ui_pop(self, payload: dict) -> None:
+        self._ui_pop_queue.append(payload)
+        while len(self._ui_pop_queue) > _UI_POP_QUEUE_MAX:
+            self._ui_pop_queue.popleft()
+
     def _show_on_main(self, payload: dict) -> None:
         app_name, title_text, msg_text, meta = _compose_message(payload)
         if not title_text and not msg_text:
             return
 
+        # 已达同时可见上限：进入 ui_pop_queue 排队（历史/webhook 由上层已处理，不丢）
+        if self.active_pop_count >= self.max_visible:
+            self._enqueue_ui_pop(payload)
+            return
+
+        self._spawn_toast(payload, app_name, title_text, msg_text, meta)
+
+    def _spawn_toast(
+        self,
+        payload: dict,
+        app_name: str,
+        title_text: str,
+        msg_text: str,
+        meta: str,
+    ) -> CustomToastNotification:
         toast = CustomToastNotification(self, payload, app_name, title_text, msg_text, meta)
         pos = self.popup_position
 
@@ -884,17 +1116,20 @@ class NotificationManager:
         else:
             self._items.append(toast)
 
-        while len(self._items) > self.max_visible:
-            if pos.startswith("top"):
-                self._items[-1].close(immediate=True)
-            else:
-                self._items[0].close(immediate=True)
-
         if payload.get("play_sound"):
             _play_notify_sound()
 
         self._layout(slide=toast)
+        return toast
 
+    def drain_ui_pop_queue(self) -> None:
+        """在可见名额有空时，从 ui_pop_queue FIFO 取出并弹出（无 sleep，主线程回调）。"""
+        while self._ui_pop_queue and self.active_pop_count < self.max_visible:
+            payload = self._ui_pop_queue.popleft()
+            app_name, title_text, msg_text, meta = _compose_message(payload)
+            if not title_text and not msg_text:
+                continue
+            self._spawn_toast(payload, app_name, title_text, msg_text, meta)
     def test_popup(self) -> None:
         from datetime import datetime
 
@@ -915,6 +1150,8 @@ class NotificationManager:
             pass
 
     def _dismiss_all_on_main(self) -> None:
+        # 全部隐藏：清空排队，避免关完现有又立刻补弹队列
+        self.clear_ui_pop_queue()
         for item in list(self._items):
             item.close(immediate=True)
 
@@ -922,6 +1159,7 @@ class NotificationManager:
         self._destroy_all_on_main()
 
     def _destroy_all_on_main(self) -> None:
+        self.clear_ui_pop_queue()
         for item in list(self._items):
             item._destroyed = True
             item._cancel_timer()
@@ -939,6 +1177,9 @@ class NotificationManager:
             self._layout(slide=None)
         else:
             self._hide_bar.destroy_bar()
+        # 手动关闭 / 超时消失：尝试弹出排队中的下一条（layout 内部关闭溢出时不 drain，防循环）
+        if self._suppress_queue_drain == 0:
+            self.drain_ui_pop_queue()
 
     def _work_area(self) -> Tuple[int, int, int, int]:
         return _get_work_area(self.root)
@@ -948,6 +1189,12 @@ class NotificationManager:
             self._hide_bar.destroy_bar()
             return
 
+        self._suppress_queue_drain += 1
+        try:
+            self._layout_impl(slide)
+        finally:
+            self._suppress_queue_drain = max(0, self._suppress_queue_drain - 1)
+    def _layout_impl(self, slide: Optional[CustomToastNotification]) -> None:
         wa_left, wa_top, wa_w, wa_h = self._work_area()
         wa_bottom = wa_top + wa_h
         pos = self.popup_position

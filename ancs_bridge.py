@@ -104,22 +104,35 @@ def _generate_app_icon(app_name: str, out_path: Path) -> str:
         from PIL import Image, ImageDraw, ImageFont
 
         size = 128
+        scale = 4
+        big = size * scale
         letter = (app_name or "?")[0].upper()
         seed = sum(ord(c) for c in app_name)
         color = (
             80 + seed % 120,
             80 + (seed // 7) % 120,
             80 + (seed // 13) % 120,
+            255,
         )
-        img = Image.new("RGBA", (size, size), color + (255,))
-        draw = ImageDraw.Draw(img)
+        # 超采样圆形 + LANCZOS 缩小，边缘抗锯齿
+        canvas = Image.new("RGBA", (big, big), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(canvas)
+        draw.ellipse((0, 0, big - 1, big - 1), fill=color)
         try:
-            font = ImageFont.truetype("segoeui.ttf", 64)
+            font = ImageFont.truetype("segoeui.ttf", int(big * 0.42))
         except Exception:
-            font = ImageFont.load_default()
+            try:
+                font = ImageFont.truetype("C:/Windows/Fonts/msyh.ttc", int(big * 0.42))
+            except Exception:
+                font = ImageFont.load_default()
         bbox = draw.textbbox((0, 0), letter, font=font)
         tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-        draw.text(((size - tw) / 2, (size - th) / 2 - 4), letter, fill="white", font=font)
+        draw.text(((big - tw) / 2, (big - th) / 2 - big * 0.02), letter, fill="white", font=font)
+        try:
+            resample = Image.Resampling.LANCZOS
+        except AttributeError:
+            resample = getattr(Image, "LANCZOS", Image.BICUBIC)
+        img = canvas.resize((size, size), resample)
         out_path.parent.mkdir(parents=True, exist_ok=True)
         img.save(out_path, "PNG")
         return str(out_path)
@@ -381,7 +394,14 @@ def load_config(path: str) -> "BridgeConfig":
             d["privacy_show_msg"] = not bool(d.get("privacy_hide_msg"))
         fields = {f.name for f in dataclasses.fields(BridgeConfig)}
         filtered = {k: v for k, v in d.items() if k in fields}
-        return BridgeConfig(**filtered)
+        cfg = BridgeConfig(**filtered)
+        # 旧配置缺 key 时 dataclass 默认 8；再钳位非法值到 3–120
+        try:
+            v = int(str(getattr(cfg, "notification_auto_close_seconds", 8)).strip())
+            cfg.notification_auto_close_seconds = max(3, min(120, v))
+        except Exception:
+            cfg.notification_auto_close_seconds = 8
+        return cfg
     except Exception:
         return BridgeConfig()
 
@@ -466,6 +486,11 @@ class BridgeConfig:
     notification_width: int = 420
     notification_font_size: int = 10
     max_preview_chars: int = 50
+    # 屏幕最多同时可见弹窗数；超额进入 ui_pop_queue 排队，关闭后依次弹出（不再丢弃弹窗）
+    max_pop_notification: int = 3
+    notification_auto_close_seconds: int = 8
+    auto_backup_enable: bool = False
+    auto_backup_path: str = ""
     privacy_show_title: bool = True
     privacy_show_msg: bool = True
 
@@ -830,6 +855,16 @@ class BridgeManager:
 
         self._dedup: Dict[str, float] = {}
         self._lock = threading.Lock()
+
+    def apply_runtime_config(self, cfg: BridgeConfig) -> None:
+        """热更新运行时配置：同步到 Manager 与全部 ANCS Session（不影响已连接链路）。"""
+        self.cfg = cfg
+        with self._lock:
+            for session in list(self._sessions.values()):
+                try:
+                    session.cfg = cfg
+                except Exception:
+                    pass
 
     async def scan_heart_rate(self, timeout: int = 8) -> List[Tuple[str, str, int]]:
         devices = await BleakScanner.discover(timeout=timeout)

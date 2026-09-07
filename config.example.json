@@ -48,6 +48,10 @@
   "notification_width": 420,
   "notification_font_size": 10,
   "max_preview_chars": 50,
+  "max_pop_notification": 3,
+  "notification_auto_close_seconds": 8,
+  "auto_backup_enable": false,
+  "auto_backup_path": "",
   "privacy_show_title": true,
   "privacy_show_msg": true,
   "push_template": "设备：{device}\n【{app}】\n标题：{title}\n内容：{msg}\n时间：{date}\n电量：{battery}"
