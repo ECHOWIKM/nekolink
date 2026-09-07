@@ -711,6 +711,7 @@ class _ANCSSession:
             return
         try:
             title_len = 64
+            subtitle_len = 64
             msg_len = 256
 
             payload = bytearray()
@@ -721,6 +722,9 @@ class _ANCSSession:
 
             payload.append(ATTR_TITLE)
             payload += int(title_len).to_bytes(2, "little")
+
+            payload.append(ATTR_SUBTITLE)
+            payload += int(subtitle_len).to_bytes(2, "little")
 
             payload.append(ATTR_MESSAGE)
             payload += int(msg_len).to_bytes(2, "little")
@@ -778,9 +782,19 @@ class _ANCSSession:
             app = attrs.get(ATTR_APP_IDENTIFIER, "") or ""
             title = attrs.get(ATTR_TITLE, "") or ""
             msg = attrs.get(ATTR_MESSAGE, "") or ""
+            subtitle = attrs.get(ATTR_SUBTITLE, "") or ""
+            subtitle = subtitle.strip()
             date = attrs.get(ATTR_DATE, "") or ""
 
-            merged_text = "\n".join([app, title, msg, date]).strip()
+            # 把“发送者”(subtitle) 合并进 msg，避免 iOS 三级结构里发送者信息丢失。
+            # 边界处理：subtitle 为空则不合并；msg 已含发送者前缀则跳过，避免“发送者：发送者：…”；
+            # subtitle 若自带尾部冒号先剥掉，避免出现“发送者：: 正文”。
+            if subtitle:
+                sender = subtitle.rstrip("：:")
+                if sender and not msg.startswith(sender):
+                    msg = f"{sender}: {msg}"
+
+            merged_text = "\n".join([app, title, subtitle, msg, date]).strip()
             if _contains_block_keyword(merged_text, self.cfg.block_keywords, self.cfg.block_case_insensitive):
                 self.log(f"[{self.addr}] [FILTER] blocked")
                 return
@@ -798,6 +812,7 @@ class _ANCSSession:
                 "battery": bat,
                 "app": app,
                 "title": title,
+                "subtitle": subtitle,
                 "msg": msg,
                 "date": date,
                 "codes": codes,

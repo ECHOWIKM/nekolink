@@ -24,6 +24,12 @@ except Exception:
 _TRANSPARENT = "#010101"
 _LINE_RE = re.compile(r"^(.+?[：:])(.*)$")
 _BRACKET_RE = re.compile(r"^【.+】$")
+_TRAILING_COLON_RE = re.compile(r"[：:]\s*$")
+
+# IM 类应用：iOS 推送模板把“群名：”放进 title、“发送者：正文”放进 msg，
+# 桌面弹窗若照单全收会渲染成“群名：发送者：正文”的双冒号并列。
+# 这些应用的 title 尾部冒号只是模板分隔符，剥离后由 msg 里的“发送者：”承担唯一分隔。
+_IM_APP_NAMES = frozenset({"QQ", "微信", "钉钉", "企业微信", "短信"})
 
 # 颜色
 _CLR_APP = "#111111"
@@ -326,6 +332,18 @@ def _parse_fields(body_text: str) -> dict:
     return fields
 
 
+def _clean_im_title_msg(app_name: str, title: str, msg: str) -> Tuple[str, str]:
+    """IM 类应用：剥离 title 尾部冒号，保留 msg 中的“发送者：正文”。
+
+    仅对 QQ/微信/钉钉/企业微信/短信等 IM 应用生效，其它应用（如网易云音乐、滴滴）
+    原样返回，不改变任何行为。
+    """
+    if app_name not in _IM_APP_NAMES:
+        return title, msg
+    title = _TRAILING_COLON_RE.sub("", title or "").strip()
+    return title, msg
+
+
 def _compose_message(payload: dict) -> Tuple[str, str, str, str]:
     """返回 app_name, title字段, msg字段, meta。"""
     app_name = _truncate(payload.get("app_name") or "通知", 40)
@@ -334,6 +352,7 @@ def _compose_message(payload: dict) -> Tuple[str, str, str, str]:
     ts = (payload.get("timestamp") or parsed["date"] or "").strip()
     title = _truncate((payload.get("title") or parsed["title"] or "").strip(), 120)
     msg = _truncate((payload.get("msg") or parsed["msg"] or "").strip(), 300)
+    title, msg = _clean_im_title_msg(app_name, title, msg)
     meta = " · ".join(x for x in (device, ts) if x)
     return app_name, title, msg, meta
 
