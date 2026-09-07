@@ -10,12 +10,13 @@ from __future__ import annotations
 from typing import Any
 
 # ---------- 全局颜色 ----------
-MAIN_BG = "#f7f9fc"
-CARD_BG = "#ffffff"
+MAIN_BG = "#F7F9FC"
+PAGE_BG_COLOR = MAIN_BG  # 别名：页面/滚动容器背景
+CARD_BG = "#FFFFFF"
 PRIMARY_BLUE = "#2382dd"
-TEXT_MAIN = "#1f2937"
-TEXT_SECONDARY = "#6b7280"
-TEXT_GRAY = "#9ca3af"
+TEXT_MAIN = "#1C1C1C"
+TEXT_SECONDARY = "#6B7280"
+TEXT_GRAY = "#9CA3AF"
 BORDER_COLOR = "#e5e7eb"
 HOVER_BLUE = "#1d92c7"
 DANGER_RED = "#ef4444"
@@ -30,6 +31,8 @@ FONT_SMALL = (FONT_FAMILY, 9, "normal")
 FONT_SMALL_GRAY = (FONT_FAMILY, 9, "normal")
 # 顶栏大标题（同族，略大）
 FONT_HEADER = (FONT_FAMILY, 16, "bold")
+# 顶部品牌标题：比导航标签（FONT_NORMAL=10）稍大
+FONT_BRAND = (FONT_FAMILY, 12, "bold")
 
 # ---------- 全局间距 ----------
 PAGE_PADX = 16

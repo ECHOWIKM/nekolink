@@ -438,6 +438,12 @@ def load_config(path: str) -> "BridgeConfig":
             cfg.desktop_toast_auto_dismiss = max(3, min(120, dv))
         except Exception:
             cfg.desktop_toast_auto_dismiss = 10
+        # 桌面弹窗卡片垂直间距：缺省 12，钳位 4–60
+        try:
+            gv = int(float(str(getattr(cfg, "popup_card_gap", 12)).strip()))
+            cfg.popup_card_gap = max(4, min(60, gv))
+        except Exception:
+            cfg.popup_card_gap = 12
         # 提示音：缺省 true / 80 / notify.wav，音量钳位 0–100
         try:
             cfg.sound_enable = bool(getattr(cfg, "sound_enable", True))
@@ -471,6 +477,23 @@ def load_config(path: str) -> "BridgeConfig":
                 cfg.app_sound_map = cleaned
         except Exception:
             cfg.app_sound_map = {}
+        # 开机自启：auto_start 为主；兼容旧字段 autostart_enabled
+        try:
+            if "auto_start" in filtered:
+                cfg.auto_start = bool(getattr(cfg, "auto_start", False))
+            elif "autostart_enabled" in filtered:
+                cfg.auto_start = bool(getattr(cfg, "autostart_enabled", False))
+            else:
+                cfg.auto_start = False
+            cfg.autostart_enabled = bool(cfg.auto_start)
+        except Exception:
+            cfg.auto_start = False
+            cfg.autostart_enabled = False
+        try:
+            tip = str(getattr(cfg, "tray_icon_path", "") or "").strip()
+            cfg.tray_icon_path = tip or "assets/icon.ico"
+        except Exception:
+            cfg.tray_icon_path = "assets/icon.ico"
         return cfg
     except Exception:
         return BridgeConfig()
@@ -549,8 +572,11 @@ class BridgeConfig:
     # history
     history_limit: int = 300
 
-    # autostart
+    # autostart（auto_start 为主字段；autostart_enabled 兼容旧配置）
+    auto_start: bool = False
     autostart_enabled: bool = False
+    # 托盘 / 状态栏图标（相对项目根或绝对路径）；空则回退默认 icon.ico
+    tray_icon_path: str = "assets/icon.ico"
 
     # misc
     show_battery_in_message: bool = True
@@ -561,6 +587,8 @@ class BridgeConfig:
     max_preview_chars: int = 50
     # 屏幕最多同时可见弹窗数；超额进入 ui_pop_queue 排队，关闭后依次弹出（不再丢弃弹窗）
     max_pop_notification: int = 3
+    # 桌面 TG 弹窗卡片垂直间距(px)；改后需重启生效
+    popup_card_gap: int = 12
     notification_auto_close_seconds: int = 8
     # 桌面自定义弹窗自动关闭秒数（与 notification_auto_close_seconds 同步写入）
     desktop_toast_auto_dismiss: int = 10

@@ -18,10 +18,34 @@ DICT: Dict[str, Dict[str, str]] = {
         "ja": "NekoLink · iPhone 通知ブリッジ（Windows）",
     },
     "header_line": {
-        "zh": "iPhone → Windows → Telegram / 钉钉 / Gotify / 邮件",
-        "en": "iPhone → Windows → Telegram / DingTalk / Gotify / Email",
-        "ja": "iPhone → Windows → Telegram / DingTalk / Gotify / メール",
+        "zh": "🐾 NekoLink",
+        "en": "🐾 NekoLink",
+        "ja": "🐾 NekoLink",
     },
+    "header_brand": {
+        "zh": "🐾 NekoLink",
+        "en": "🐾 NekoLink",
+        "ja": "🐾 NekoLink",
+    },
+    "misc_auto_start": {
+        "zh": "开机自动启动 NekoLink",
+        "en": "Start NekoLink with Windows",
+        "ja": "起動時に NekoLink を自動実行",
+    },
+    "misc_auto_start_hint": {
+        "zh": "开启后程序随系统开机自动运行",
+        "en": "Launch automatically when Windows starts",
+        "ja": "Windows 起動時に自動実行します",
+    },
+    "auto_start_on": {"zh": "已开启开机自启动", "en": "Auto-start enabled", "ja": "自動起動を有効にしました"},
+    "auto_start_off": {"zh": "已关闭开机自启动", "en": "Auto-start disabled", "ja": "自動起動を無効にしました"},
+    "misc_tray_icon": {"zh": "状态栏图标", "en": "Tray icon", "ja": "トレイアイコン"},
+    "misc_tray_icon_hint": {
+        "zh": "修改状态栏图标后需要重启程序生效",
+        "en": "Restart required after changing tray icon",
+        "ja": "トレイアイコン変更後は再起動が必要です",
+    },
+    "browse": {"zh": "浏览", "en": "Browse", "ja": "参照"},
     "status_stopped": {"zh": "● 已停止", "en": "● Stopped", "ja": "● 停止中"},
     "status_running": {"zh": "● 运行中", "en": "● Running", "ja": "● 実行中"},
     "config_path": {"zh": "配置", "en": "Config", "ja": "設定"},
@@ -35,7 +59,18 @@ DICT: Dict[str, Dict[str, str]] = {
     "tab_logs": {"zh": "日志", "en": "Logs", "ja": "ログ"},
 
     "save": {"zh": "保存", "en": "Save", "ja": "保存"},
-    "save_all": {"zh": "保存（全部）", "en": "Save (All)", "ja": "保存（全て）"},
+    "save_all": {"zh": "保存", "en": "Save", "ja": "保存"},
+    "config_saved": {"zh": "配置已保存", "en": "Configuration saved", "ja": "設定を保存しました"},
+    "saved_restart_hint": {
+        "zh": "部分设置（字体大小、弹窗宽度）需重启程序生效。",
+        "en": "Some settings (font size, popup width) require a restart.",
+        "ja": "一部の設定（フォント/幅）は再起動後に有効です。",
+    },
+    "saved_hot_reload": {
+        "zh": "配置已保存。关键词/图标/弹窗数量等已立即生效；字号与弹窗宽度需重启后生效。",
+        "en": "Saved. Keywords/icons/popup limits apply now; font size and width need restart.",
+        "ja": "保存しました。キーワード等は即時反映。フォント/幅は再起動後に有効。",
+    },
     "start": {"zh": "启动", "en": "Start", "ja": "開始"},
     "stop": {"zh": "停止", "en": "Stop", "ja": "停止"},
     "scan": {"zh": "扫描", "en": "Scan", "ja": "スキャン"},
@@ -162,6 +197,12 @@ DICT: Dict[str, Dict[str, str]] = {
         "en": "Max visible toasts; extras queue and show as others close.",
         "ja": "同時表示上限；超過分は待機し、閉じると順に表示。",
     },
+    "misc_card_gap": {"zh": "弹窗卡片垂直间距(px)", "en": "Toast card gap (px)", "ja": "通知カード縦間隔(px)"},
+    "misc_card_gap_hint": {
+        "zh": "范围4‑60，控制多个桌面弹窗互相之间的空隙。",
+        "en": "Range 4–60; vertical gap between stacked desktop toasts.",
+        "ja": "範囲4〜60。デスクトップ通知の縦間隔。",
+    },
     "misc_auto_close": {
         "zh": "通知弹窗自动显示时长(秒)",
         "en": "Toast auto-close (seconds)",
@@ -213,11 +254,6 @@ DICT: Dict[str, Dict[str, str]] = {
         "zh": "修改后需要重启程序生效",
         "en": "Restart required for this change",
         "ja": "変更後は再起動が必要です",
-    },
-    "saved_hot_reload": {
-        "zh": "设置已保存。关键词/图标/弹窗数量等已立即生效；字号与弹窗宽度需重启后生效。",
-        "en": "Saved. Keywords/icons/popup limits apply now; font size and width need restart.",
-        "ja": "保存しました。キーワード等は即時反映。フォント/幅は再起動後に有効。",
     },
     "privacy_title": {"zh": "隐私设置", "en": "Privacy", "ja": "プライバシー"},
     "privacy_show_title": {

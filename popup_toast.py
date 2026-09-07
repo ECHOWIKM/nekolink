@@ -15,14 +15,16 @@ from collections import deque
 from typing import Callable, Deque, List, Optional, Tuple
 
 try:
-    from PIL import Image, ImageDraw, ImageFont, ImageTk
+    from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageTk
 except Exception:
     Image = None
     ImageDraw = None
+    ImageFilter = None
     ImageFont = None
     ImageTk = None
 
 _TRANSPARENT = "#010101"
+_TRANSPARENT_RGB = (1, 1, 1)
 _LINE_RE = re.compile(r"^(.+?[：:])(.*)$")
 _BRACKET_RE = re.compile(r"^【.+】$")
 
@@ -34,6 +36,25 @@ _CLR_META = "#777777"
 _CLR_CLOSE = "#b0b0b0"
 _CLR_CLOSE_HOVER = "#e53935"
 _CLR_BAR_HOVER = "#f5f7fa"
+
+# ---------------------------------------------------------------------------
+# 桌面弹窗卡片【全局统一样式】——所有卡片共用同一套常量，禁止按条随机/叠加变色
+# ---------------------------------------------------------------------------
+_CARD_BG = "#F7F9FC"
+_CARD_BG_RGB = (247, 249, 252)
+_CARD_ALPHA = 0.92  # 窗口统一透明度；滑入结束/悬停恢复均用此值
+_RADIUS = 16  # corner_radius
+_SHADOW_RGB = (0, 0, 0)  # shadow_color
+_SHADOW_ALPHA = 0.08
+# 阴影只向上/左右；禁止向下投射（否则会染到下一张卡并制造假空隙）
+_SHADOW_OFFSET = (0, -4)
+_SHADOW_BLUR = 12
+# 左右/上方为阴影留空；底部垫高必须为 0（窗口外框无额外外边距）
+_SHADOW_PAD = max(12, _SHADOW_BLUR // 2 + 2)  # 左右
+_SHADOW_TOP_PAD = max(10, (_SHADOW_BLUR // 2) + abs(_SHADOW_OFFSET[1]) + 2)
+_SHADOW_BOTTOM_PAD = 0
+_CARD_OUTLINE = (209, 213, 219)  # #d1d5db
+_CARD_IMG_CACHE_VER = "card_v4_noshadow_down"
 
 # 默认尺寸与隐私
 NOTIFICATION_WIDTH = 420
@@ -68,15 +89,15 @@ _PAD_Y = 10
 _WIDTH = DEFAULT_NOTIFICATION_WIDTH
 _BAR_H = 36
 _BAR_GAP = 8
-_CARD_GAP = 14
+_CARD_GAP = 12  # 默认垂直间距；运行时以 NotificationManager.card_gap 为准
 _MARGIN = 20
+DEFAULT_POPUP_CARD_GAP = 12
+MIN_POPUP_CARD_GAP = 4
+MAX_POPUP_CARD_GAP = 60
 _AVATAR = 48  # 通知卡片左上角图标统一显示尺寸
 _PAD = _PAD_X
-_RADIUS = 16  # 通知卡片四周圆角
 _BAR_RADIUS = 12  # 「全部隐藏」按钮圆角
 _TOP_BAR_FONT_SIZE = 16  # 「全部隐藏」文字字号
-_SHADOW_PAD = 8
-_CARD_OUTLINE = (209, 213, 219)  # #d1d5db
 _DURATION_MS = 8000  # 默认 8 秒；运行时以 NotificationManager.duration_ms 为准
 _SLIDE_MS = 250
 _FADE_MS = 400
@@ -121,8 +142,7 @@ def _remove_white_edge(img):
 
 def _fit_icon_on_white(src, size: int):
     """
-    等比例 LANCZOS 缩放 → 居中到 size×size 透明画布 → alpha 合成到白底。
-    消除透明杂边/白点；禁止拉伸变形与 NEAREST。
+    等比例 LANCZOS 缩放 → 居中到 size×size 透明画布 → alpha 合成到统一卡片底色。
     """
     img = src.convert("RGBA") if src.mode != "RGBA" else src.copy()
     img.thumbnail((size, size), _lanczos_resample())
@@ -131,8 +151,8 @@ def _fit_icon_on_white(src, size: int):
     paste_y = (size - img.height) // 2
     canvas.paste(img, (paste_x, paste_y), mask=img)
     canvas = _remove_white_edge(canvas)
-    white_bg = Image.new("RGBA", (size, size), (255, 255, 255, 255))
-    return Image.alpha_composite(white_bg, canvas)
+    card_bg = Image.new("RGBA", (size, size), (*_CARD_BG_RGB, 255))
+    return Image.alpha_composite(card_bg, canvas)
 
 
 # 可选值："top_left", "bottom_left", "top_right", "bottom_right"
@@ -224,6 +244,15 @@ def normalize_max_pop_notification(n) -> int:
     return max(1, min(10, v))
 
 
+def normalize_popup_card_gap(n) -> int:
+    """桌面弹窗卡片垂直间距(px)，钳位 4–60；非法输入回退默认 12。"""
+    try:
+        v = int(float(str(n).strip()))
+    except (TypeError, ValueError, AttributeError):
+        return DEFAULT_POPUP_CARD_GAP
+    return max(MIN_POPUP_CARD_GAP, min(MAX_POPUP_CARD_GAP, v))
+
+
 def normalize_notification_auto_close_seconds(n) -> int:
     """弹窗自动关闭秒数，钳位到 3–120；非法输入回退默认 8。"""
     try:
@@ -309,13 +338,13 @@ def _make_title_msg_line(
     title_font = (_FONT_FAMILY, font_size, "bold")
     body_font = (_FONT_FAMILY, font_size)
 
-    block = tk.Frame(parent, bg="#ffffff", bd=0, highlightthickness=0)
+    block = tk.Frame(parent, bg=_CARD_BG, bd=0, highlightthickness=0)
     block.pack(anchor="w", fill=tk.X, pady=(2, 0))
 
     def _title_canvas(text: str) -> tk.Canvas:
         cv = tk.Canvas(
             block,
-            bg="#ffffff",
+            bg=_CARD_BG,
             highlightthickness=0,
             bd=0,
             relief=tk.FLAT,
@@ -347,7 +376,7 @@ def _make_title_msg_line(
             fg="#333333",
             foreground="#333333",
             font=body_font,
-            bg="#ffffff",
+            bg=_CARD_BG,
             bd=0,
             highlightthickness=0,
             relief=tk.FLAT,
@@ -451,46 +480,106 @@ def _compose_message(payload: dict) -> Tuple[str, str, str, str]:
     return app_name, title, msg, meta
 
 
+def _rgba_flatten_chromakey(rgba: "Image.Image") -> "Image.Image":
+    """RGBA → RGB：透明区写色键；半透明按 alpha 合成到色键，保证各卡边缘一致。"""
+    key_rgba = (*_TRANSPARENT_RGB, 255)
+    base = Image.new("RGBA", rgba.size, key_rgba)
+    merged = Image.alpha_composite(base, rgba.convert("RGBA"))
+    rgb = merged.convert("RGB")
+    # alpha==0 → 纯色键（避免合成噪声导致色键失效）
+    alpha = rgba.getchannel("A")
+    mask = alpha.point(lambda a: 255 if a == 0 else 0)
+    key_rgb_img = Image.new("RGB", rgba.size, _TRANSPARENT_RGB)
+    rgb.paste(key_rgb_img, mask=mask)
+    return rgb
+
+
 def _make_card_image(
-    content_w: int, content_h: int, outer_w: int
+    content_w: int,
+    content_h: int,
+    outer_w: int,
+    cache: Optional[dict] = None,
 ) -> Tuple[Optional["ImageTk.PhotoImage"], int, int, int, int]:
     """
-    绘制单层白色圆角卡片 + 外侧浅灰柔影（RGB 色键底 #010101）。
-    content_h 为白色圆角区域高度（应已含内容四周安全边距）。
+    使用全局统一样式绘制单层圆角卡片 + 向上/左右柔和阴影（裁剪掉向下部分）。
     返回 (photo, outer_w, outer_h, content_offset_x, content_offset_y)。
     """
-    pad = _SHADOW_PAD
-    card_w = max(40, outer_w - pad * 2)
+    side = _SHADOW_PAD
+    top = _SHADOW_TOP_PAD
+    bottom = _SHADOW_BOTTOM_PAD  # 必须为 0：窗口底部不加外边距
+    card_w = max(40, outer_w - side * 2)
     card_h = max(40, content_h)
-    # 柔影右下偏移；浅灰禁止黑块/白垫层
-    sh_x, sh_y = 2, 6
-    outer_h = card_h + pad * 2 + sh_y
+    sh_x, sh_y = _SHADOW_OFFSET
+    outer_h = top + card_h + bottom
+    cache_key = (_CARD_IMG_CACHE_VER, outer_w, outer_h, card_w, card_h)
+    if cache is not None and cache_key in cache:
+        return cache[cache_key], outer_w, outer_h, side, top
+
     if Image is None or ImageDraw is None or ImageTk is None:
-        return None, outer_w, outer_h, pad, pad
+        return None, outer_w, outer_h, side, top
 
-    key_rgb = (1, 1, 1)
-    img = Image.new("RGB", (outer_w, outer_h), key_rgb)
-    draw = ImageDraw.Draw(img)
+    rgba = Image.new("RGBA", (outer_w, outer_h), (0, 0, 0, 0))
+    shadow_layer = Image.new("RGBA", (outer_w, outer_h), (0, 0, 0, 0))
+    sdraw = ImageDraw.Draw(shadow_layer)
+    shadow_a = max(1, min(255, int(round(255 * _SHADOW_ALPHA))))
+    # 阴影锚在卡片位置，再按 offset 向上/左右偏移（sh_y < 0 → 向上）
+    sdraw.rounded_rectangle(
+        [
+            side + sh_x,
+            top + sh_y,
+            side + sh_x + card_w - 1,
+            top + sh_y + card_h - 1,
+        ],
+        radius=_RADIUS,
+        fill=(*_SHADOW_RGB, shadow_a),
+    )
+    if ImageFilter is not None and _SHADOW_BLUR > 0:
+        try:
+            shadow_layer = shadow_layer.filter(
+                ImageFilter.GaussianBlur(radius=max(0.5, _SHADOW_BLUR / 2.0))
+            )
+        except Exception:
+            pass
+    # 硬裁剪：卡片底边以下阴影全部清零，杜绝向下投射染色下一张卡
+    try:
+        card_bottom = top + card_h
+        if card_bottom < outer_h:
+            clear = Image.new("RGBA", (outer_w, outer_h - card_bottom), (0, 0, 0, 0))
+            shadow_layer.paste(clear, (0, card_bottom))
+        # 底边一行也清掉，避免 blur 贴边残留
+        if card_bottom > 0:
+            row = Image.new("RGBA", (outer_w, 1), (0, 0, 0, 0))
+            shadow_layer.paste(row, (0, min(card_bottom - 1, outer_h - 1)))
+    except Exception:
+        pass
+    rgba = Image.alpha_composite(rgba, shadow_layer)
 
-    # 浅灰柔影
-    draw.rounded_rectangle(
-        [pad + sh_x, pad + sh_y, pad + sh_x + card_w - 1, pad + sh_y + card_h - 1],
+    card_layer = Image.new("RGBA", (outer_w, outer_h), (0, 0, 0, 0))
+    cdraw = ImageDraw.Draw(card_layer)
+    cdraw.rounded_rectangle(
+        [side, top, side + card_w - 1, top + card_h - 1],
         radius=_RADIUS,
-        fill=(224, 226, 230),
+        fill=(*_CARD_BG_RGB, 255),
     )
-    # 唯一白色圆角卡片（四角 radius=16）
-    draw.rounded_rectangle(
-        [pad, pad, pad + card_w - 1, pad + card_h - 1],
-        radius=_RADIUS,
-        fill=(255, 255, 255),
-    )
-    draw.rounded_rectangle(
-        [pad, pad, pad + card_w - 1, pad + card_h - 1],
+    cdraw.rounded_rectangle(
+        [side, top, side + card_w - 1, top + card_h - 1],
         radius=_RADIUS,
         outline=_CARD_OUTLINE,
         width=1,
     )
-    return ImageTk.PhotoImage(img), outer_w, outer_h, pad, pad
+    rgba = Image.alpha_composite(rgba, card_layer)
+
+    photo = ImageTk.PhotoImage(_rgba_flatten_chromakey(rgba))
+    if cache is not None:
+        cache[cache_key] = photo
+    return photo, outer_w, outer_h, side, top
+
+
+def _set_toast_alpha(win: tk.Misc, alpha: float) -> None:
+    try:
+        win.attributes("-alpha", max(0.0, min(1.0, float(alpha))))
+    except tk.TclError:
+        pass
 
 
 def _load_avatar(app_name: str, icon_path: str, cache: dict) -> Optional[tk.PhotoImage]:
@@ -499,7 +588,7 @@ def _load_avatar(app_name: str, icon_path: str, cache: dict) -> Optional[tk.Phot
     禁止 tk subsample/zoom / NEAREST；结果固定 size×size，避免撑大卡片。
     """
     size = _AVATAR
-    key = f"{icon_path or app_name}:{size}:thumb-white-v2"
+    key = f"{icon_path or app_name}:{size}:thumb-cardbg-v3"
     if key in cache:
         return cache[key]
 
@@ -542,8 +631,8 @@ def _load_avatar(app_name: str, icon_path: str, cache: dict) -> Optional[tk.Phot
                 font=font,
             )
             letter_rgba = canvas.resize((size, size), _lanczos_resample())
-            white_bg = Image.new("RGBA", (size, size), (255, 255, 255, 255))
-            img = Image.alpha_composite(white_bg, letter_rgba)
+            card_bg = Image.new("RGBA", (size, size), (*_CARD_BG_RGB, 255))
+            img = Image.alpha_composite(card_bg, letter_rgba)
         except Exception as e:
             print(f"[toast] letter avatar failed: {e}")
             img = None
@@ -705,6 +794,10 @@ class CustomToastNotification:
         self.duration_ms = max(1000, int(getattr(manager, "duration_ms", _DURATION_MS) or _DURATION_MS))
         self.outer_w = self.card_width
         self.outer_h = 90
+        self.pad_top = _SHADOW_TOP_PAD
+        self.pad_bottom = _SHADOW_BOTTOM_PAD
+        self.pad_side = _SHADOW_PAD
+        self.card_body_h = 90
         self.target_x = 0
         self.target_y = 0
         # 圆角安全边距：白底内容矩形不得盖住四角圆弧
@@ -716,20 +809,21 @@ class CustomToastNotification:
         self.win.withdraw()
         self.win.overrideredirect(True)
         self.win.attributes("-topmost", True)
-        self.win.attributes("-alpha", 0.0)
+        _set_toast_alpha(self.win, 0.0)
         self.win.configure(bg=_TRANSPARENT)
         try:
             self.win.attributes("-transparentcolor", _TRANSPARENT)
         except tk.TclError:
             pass
 
+        # 外层容器禁止 padx/pady：外边距会直接放大窗口间视觉空隙
         self._shell = tk.Frame(self.win, bg=_TRANSPARENT, bd=0, highlightthickness=0)
-        self._shell.pack()
+        self._shell.pack(padx=0, pady=0)
 
         self._bg_lbl = tk.Label(self._shell, bd=0, highlightthickness=0, bg=_TRANSPARENT)
-        # 内容白底 Frame：尺寸小于圆角白卡片，四周留给圆弧
+        # 内容区与卡片主背景同色，禁止再叠一层不同底色
         inner_frame = tk.Frame(
-            self._shell, bg="#ffffff", width=content_w, bd=0, highlightthickness=0
+            self._shell, bg=_CARD_BG, width=content_w, bd=0, highlightthickness=0
         )
         inner_frame.pack_propagate(True)
         self._build_content(inner_frame, app_name, title_text, msg_text, meta)
@@ -739,18 +833,25 @@ class CustomToastNotification:
         # 白卡片高度 = 内容 + 上下圆角安全边距，保证直角内容盖不到四角
         card_h = content_h + corner_inset * 2
         card_w = content_w + corner_inset * 2
-        # outer 宽仍用 notification_width；白区居中于阴影垫层内
-        photo, ow, oh, ox, oy = _make_card_image(card_w, card_h, self.card_width)
+        # 统一样式渲染；同尺寸复用 manager 缓存
+        if not hasattr(self.manager, "_card_bg_cache"):
+            self.manager._card_bg_cache = {}
+        photo, ow, oh, ox, oy = _make_card_image(
+            card_w, card_h, self.card_width, cache=self.manager._card_bg_cache
+        )
         self.outer_w = ow
         self.outer_h = oh
+        self.pad_side = ox
+        self.pad_top = oy
+        self.pad_bottom = _SHADOW_BOTTOM_PAD
+        self.card_body_h = card_h
         self._bg_photo = photo
         if photo:
             self._bg_lbl.configure(image=photo)
             self._bg_lbl.image = photo
-        self._bg_lbl.pack()
-        # 内容置于白卡片内侧（ox/oy 为白卡片左上角）
+        self._bg_lbl.pack(padx=0, pady=0)
+        # 内容置于卡片内侧（ox/oy 为圆角卡片左上角）
         white_w = max(40, self.card_width - _SHADOW_PAD * 2)
-        # 水平居中内容于白卡片
         place_x = ox + max(0, (white_w - content_w) // 2)
         place_y = oy + corner_inset
         inner_frame.place(
@@ -759,6 +860,16 @@ class CustomToastNotification:
             width=content_w,
             height=content_h,
         )
+
+        # 固定几何尺寸 → update_idletasks 完成渲染 → 再读真实高度
+        try:
+            self.win.geometry(f"{self.outer_w}x{self.outer_h}")
+            self.win.update_idletasks()
+            mapped_h = int(self.win.winfo_height())
+            if mapped_h > 1:
+                self.outer_h = mapped_h
+        except tk.TclError:
+            pass
 
         self._bind_hover(self.win)
         self._bind_hover(self._shell)
@@ -817,11 +928,11 @@ class CustomToastNotification:
                 print(f"[DESKTOP-TOAST] swipe start dx={dx}")
             state["dx"] = dx
             try:
-                alpha = max(0.35, 1.0 - min(1.0, abs(dx) / 160.0) * 0.55)
+                alpha = max(0.35, _CARD_ALPHA - min(1.0, abs(dx) / 160.0) * 0.45)
                 self.win.geometry(
                     f"{self.outer_w}x{self.outer_h}+{state['ox'] + dx}+{state['oy']}"
                 )
-                self.win.attributes("-alpha", alpha)
+                _set_toast_alpha(self.win, alpha)
             except tk.TclError:
                 pass
 
@@ -842,7 +953,7 @@ class CustomToastNotification:
                     self.win.geometry(
                         f"{self.outer_w}x{self.outer_h}+{state['ox']}+{state['oy']}"
                     )
-                    self.win.attributes("-alpha", 1.0)
+                    _set_toast_alpha(self.win, _CARD_ALPHA)
                 except tk.TclError:
                     pass
                 self._hovering = False
@@ -890,17 +1001,17 @@ class CustomToastNotification:
         meta: str,
     ) -> None:
         # 内容区强制白底，避免透出黑底
-        inner = tk.Frame(parent, bg="#ffffff", bd=0, highlightthickness=0)
+        inner = tk.Frame(parent, bg=_CARD_BG, bd=0, highlightthickness=0)
         inner.pack(fill=tk.BOTH, expand=True, padx=_PAD_X, pady=_PAD_Y)
         meta_font_size = max(6, self.font_size - 2)
         wrap_w = _content_wrap_width(self.card_width)
 
-        row = tk.Frame(inner, bg="#ffffff", bd=0, highlightthickness=0)
+        row = tk.Frame(inner, bg=_CARD_BG, bd=0, highlightthickness=0)
         row.pack(fill=tk.X)
 
         av = tk.Label(
             row,
-            bg="#ffffff",
+            bg=_CARD_BG,
             bd=0,
             highlightthickness=0,
             relief=tk.FLAT,
@@ -918,16 +1029,16 @@ class CustomToastNotification:
         else:
             self._avatar_photo = None
 
-        right = tk.Frame(row, bg="#ffffff", bd=0, highlightthickness=0)
+        right = tk.Frame(row, bg=_CARD_BG, bd=0, highlightthickness=0)
         right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(10, 0))
 
-        title_row = tk.Frame(right, bg="#ffffff", bd=0, highlightthickness=0)
+        title_row = tk.Frame(right, bg=_CARD_BG, bd=0, highlightthickness=0)
         title_row.pack(fill=tk.X)
 
         tk.Label(
             title_row,
             text=app_name,
-            bg="#ffffff",
+            bg=_CARD_BG,
             fg=_CLR_APP,
             foreground=_CLR_APP,
             font=(_FONT_FAMILY, self.font_size),
@@ -940,7 +1051,7 @@ class CustomToastNotification:
         self._close = tk.Label(
             title_row,
             text="✕",
-            bg="#ffffff",
+            bg=_CARD_BG,
             fg=_CLR_CLOSE,
             foreground=_CLR_CLOSE,
             font=(_FONT_FAMILY, max(6, self.font_size - 1)),
@@ -969,7 +1080,7 @@ class CustomToastNotification:
             tk.Label(
                 right,
                 text=meta,
-                bg="#ffffff",
+                bg=_CARD_BG,
                 fg=_CLR_META,
                 foreground=_CLR_META,
                 font=(_FONT_FAMILY, meta_font_size),
@@ -1022,28 +1133,21 @@ class CustomToastNotification:
             return
         self._fading = True
         self._cancel_timer()
-        self._fade_step(1.0)
+        self._fade_step(_CARD_ALPHA)
 
     def _fade_step(self, alpha: float) -> None:
         if self._destroyed:
             return
         if self._hovering:
             self._fading = False
-            try:
-                self.win.attributes("-alpha", 1.0)
-            except tk.TclError:
-                pass
+            _set_toast_alpha(self.win, _CARD_ALPHA)
             self._schedule_dismiss()
             return
         alpha -= 1.0 / max(1, int(_FADE_MS / 20))
         if alpha <= 0:
             self.close(immediate=True)
             return
-        try:
-            self.win.attributes("-alpha", max(0.0, alpha))
-        except tk.TclError:
-            self.close(immediate=True)
-            return
+        _set_toast_alpha(self.win, max(0.0, alpha))
         self.root.after(20, lambda: self._fade_step(alpha))
 
     def slide_in(self, target_x: int, target_y: int, slide_from: str) -> None:
@@ -1064,10 +1168,7 @@ class CustomToastNotification:
             return
         if elapsed >= _SLIDE_MS:
             self.win.geometry(f"{self.outer_w}x{self.outer_h}+{x1}+{self.target_y}")
-            try:
-                self.win.attributes("-alpha", 1.0)
-            except tk.TclError:
-                pass
+            _set_toast_alpha(self.win, _CARD_ALPHA)
             self._shown_at = time.time()
             self._schedule_dismiss()
             return
@@ -1076,7 +1177,7 @@ class CustomToastNotification:
         x = int(x0 + (x1 - x0) * ease)
         try:
             self.win.geometry(f"{self.outer_w}x{self.outer_h}+{x}+{self.target_y}")
-            self.win.attributes("-alpha", min(1.0, t * 1.15))
+            _set_toast_alpha(self.win, min(_CARD_ALPHA, t * 1.15 * _CARD_ALPHA))
         except tk.TclError:
             pass
         self.root.after(16, lambda: self._slide_step(x0, x1, elapsed + 16))
@@ -1146,6 +1247,7 @@ class NotificationManager:
         max_preview_chars: int = DEFAULT_MAX_PREVIEW_CHARS,
         max_pop_notification: Optional[int] = None,
         notification_auto_close_seconds: Optional[int] = None,
+        popup_card_gap: Optional[int] = None,
     ):
         self.root = root
         self.on_click = on_click
@@ -1165,11 +1267,17 @@ class NotificationManager:
         self.privacy_show_title = bool(privacy_show_title)
         self.privacy_show_msg = bool(privacy_show_msg)
         self.max_preview_chars = normalize_max_preview_chars(max_preview_chars)
+        # 垂直间距：启动时快照；改配置需重启后生效
+        self.card_gap = normalize_popup_card_gap(
+            DEFAULT_POPUP_CARD_GAP if popup_card_gap is None else popup_card_gap
+        )
         self._items: List[CustomToastNotification] = []
         # 可视化弹窗等待队列（FIFO）；与 BLE notify_queue 无关，仅管界面展示
         self._ui_pop_queue: Deque[dict] = deque()
         self._suppress_queue_drain = 0
         self._icon_cache: dict = {}
+        # 同尺寸卡片背景图缓存：强制共用同一样式位图
+        self._card_bg_cache: dict = {}
         self._hide_bar = _HideAllBar(root, self.dismiss_all)
 
     @property
@@ -1368,6 +1476,75 @@ class NotificationManager:
     def _work_area(self) -> Tuple[int, int, int, int]:
         return _get_work_area(self.root)
 
+    def _toast_win_height(self, item: CustomToastNotification) -> int:
+        """
+        运行时真实窗口高度。必须先 update_idletasks，禁止用未渲染的假高度(1)。
+        未映射时回退 outer_h。
+        """
+        designed = max(1, int(getattr(item, "outer_h", 90) or 90))
+        try:
+            item.win.update_idletasks()
+            h = int(item.win.winfo_height())
+            if h > 1:
+                return h
+        except Exception:
+            pass
+        return designed
+
+    def _toast_pad_top(self, item: CustomToastNotification) -> int:
+        return max(0, int(getattr(item, "pad_top", _SHADOW_TOP_PAD) or 0))
+
+    def _toast_card_body_h(self, item: CustomToastNotification) -> int:
+        body = int(getattr(item, "card_body_h", 0) or 0)
+        if body > 0:
+            return body
+        h = self._toast_win_height(item)
+        return max(1, h - self._toast_pad_top(item) - int(getattr(item, "pad_bottom", 0) or 0))
+
+    def _stack_y_delta(
+        self,
+        upper: CustomToastNotification,
+        lower: CustomToastNotification,
+        gap: int,
+    ) -> int:
+        """
+        使两张白卡片之间的视觉间隙恰好等于 gap：
+        lower.y = upper.y + pad_top(upper) + card_h(upper) + gap - pad_top(lower)
+        （禁止只加减 gap / 禁止把上方阴影垫重复算进空隙）
+        """
+        return (
+            self._toast_pad_top(upper)
+            + self._toast_card_body_h(upper)
+            + gap
+            - self._toast_pad_top(lower)
+        )
+
+    def _clamp_xy(
+        self,
+        x: int,
+        y: int,
+        w: int,
+        h: int,
+        wa_left: int,
+        wa_top: int,
+        wa_w: int,
+        wa_h: int,
+    ) -> Tuple[int, int]:
+        """防止弹窗完全跑出工作区。"""
+        wa_right = wa_left + wa_w
+        wa_bottom = wa_top + wa_h
+        # 至少保留 8px 在可视区内
+        min_visible = 8
+        if x + w < wa_left + min_visible:
+            x = wa_left + min_visible - w
+        if x > wa_right - min_visible:
+            x = wa_right - min_visible
+        if y + h < wa_top + min_visible:
+            y = wa_top + min_visible - h
+        if y > wa_bottom - min_visible:
+            y = wa_bottom - min_visible
+        return x, y
+
     def _layout(self, slide: Optional[CustomToastNotification]) -> None:
         if not self._items:
             self._hide_bar.destroy_bar()
@@ -1378,17 +1555,26 @@ class NotificationManager:
             self._layout_impl(slide)
         finally:
             self._suppress_queue_drain = max(0, self._suppress_queue_drain - 1)
+
     def _layout_impl(self, slide: Optional[CustomToastNotification]) -> None:
         wa_left, wa_top, wa_w, wa_h = self._work_area()
         wa_bottom = wa_top + wa_h
         pos = self.popup_position
         m = _MARGIN
-        # 外层窗口宽（含阴影垫层）；白卡片可视宽 = 外宽 - 两侧阴影
+        gap = normalize_popup_card_gap(self.card_gap)
+
+        # 全部先强制布局，再读高度（含尚未 deiconify 的新窗）
+        for it in self._items:
+            try:
+                it.win.update_idletasks()
+            except Exception:
+                pass
+
         outer_w = self.notification_width
         if self._items:
             outer_w = max(40, int(getattr(self._items[0], "outer_w", outer_w) or outer_w))
-        pad = _SHADOW_PAD
-        visual_w = max(40, outer_w - pad * 2)
+        side = _SHADOW_PAD
+        visual_w = max(40, outer_w - side * 2)
 
         if "right" in pos:
             x = wa_left + wa_w - outer_w - m
@@ -1397,30 +1583,55 @@ class NotificationManager:
             x = wa_left + m
             slide_from = "left"
 
-        cards_h = sum(it.outer_h for it in self._items) + _CARD_GAP * max(0, len(self._items) - 1)
-        cluster_h = _BAR_H + _BAR_GAP + cards_h
+        # 列表顺序：top_* 新消息在前；bottom_* 新消息在后
+        order = list(self._items)
+        n = len(order)
+        if n == 0:
+            self._hide_bar.destroy_bar()
+            return
 
-        if pos.startswith("bottom"):
-            bar_y = wa_bottom - m - cluster_h
-            order = list(self._items)
-        else:
+        heights = [self._toast_win_height(it) for it in order]
+        ys: List[int] = [0] * n
+
+        # ---- 四方位统一堆叠 ----
+        # 上锚点（左上/右上）：自上而下 new_y = last_y + delta(last, next)
+        # 下锚点（左下/右下）：自下而上，等价 new_y = last_y - delta(prev, last)
+        if pos.startswith("top"):
             bar_y = wa_top + m
-            order = list(self._items)
+            self._hide_bar.show_at(x + side, bar_y, visual_w)
+            ys[0] = bar_y + _BAR_H + _BAR_GAP
+            for i in range(1, n):
+                # 往下堆叠
+                ys[i] = ys[i - 1] + self._stack_y_delta(order[i - 1], order[i], gap)
+        else:
+            # 底部：最新一条贴底，再向上堆叠
+            ys[n - 1] = wa_bottom - m - heights[n - 1]
+            for i in range(n - 2, -1, -1):
+                # 往上：upper = order[i], lower = order[i+1]
+                # lower.y = upper.y + delta → upper.y = lower.y - delta
+                ys[i] = ys[i + 1] - self._stack_y_delta(order[i], order[i + 1], gap)
+            topmost_y = ys[0]
+            bar_y = topmost_y - _BAR_GAP - _BAR_H
+            # 边界：栏也不能超出工作区顶
+            if bar_y < wa_top + m:
+                shift = (wa_top + m) - bar_y
+                bar_y += shift
+                ys = [y + shift for y in ys]
+            self._hide_bar.show_at(x + side, bar_y, visual_w)
 
-        # 「全部隐藏」与白卡片左右齐平：同 inset，同可视宽度（禁止用整窗宽导致比卡片更宽）
-        self._hide_bar.show_at(x + pad, bar_y, visual_w)
-        y = bar_y + _BAR_H + _BAR_GAP
-
-        for item in order:
-            if y + item.outer_h > wa_bottom - m or y < wa_top + m:
+        for i, item in enumerate(order):
+            h = heights[i]
+            y = ys[i]
+            # 完全跑出工作区则关闭（过高堆叠）
+            if y + h < wa_top + m or y > wa_bottom - m:
                 if item in self._items:
                     item.close(immediate=True)
                 continue
+            cx, cy = self._clamp_xy(x, y, outer_w, h, wa_left, wa_top, wa_w, wa_h)
             if item is slide:
-                item.slide_in(x, y, slide_from)
+                item.slide_in(cx, cy, slide_from)
             else:
-                item.move_to(x, y)
-            y += item.outer_h + _CARD_GAP
+                item.move_to(cx, cy)
 
 
 PopupToastManager = NotificationManager

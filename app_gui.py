@@ -45,6 +45,7 @@ from popup_toast import (
     normalize_max_preview_chars,
     normalize_max_pop_notification,
     normalize_notification_auto_close_seconds,
+    normalize_popup_card_gap,
     parse_notification_auto_close_seconds,
     NOTIFICATION_WIDTH_LABELS,
     NOTIFICATION_FONT_LABELS,
@@ -61,14 +62,18 @@ from sound_helper import (
     update_runtime_sound_config,
 )
 from ui_theme import (
-    FONT_HEADER,
+    FONT_BRAND,
+    MAIN_BG,
+    PAGE_BG_COLOR,
     PAGE_PADX,
     PAGE_PADY,
+    TEXT_MAIN,
     apply_global_theme,
 )
 
 CONFIG_PATH = get_config_path()
 ICON_PATH = "icon.ico"
+DEFAULT_TRAY_ICON_REL = "assets/icon.ico"
 
 # ---------------------------------------------------------------------------
 # 历史消息内存 / 磁盘评估（注释说明，非自动备份业务）
@@ -95,6 +100,51 @@ def _backup_dir() -> Path:
 
 def _default_auto_backup_path() -> Path:
     return _backup_dir() / "notification_auto_backup.csv"
+
+
+def resolve_tray_icon_path(cfg: Optional[BridgeConfig] = None) -> Optional[str]:
+    """
+    按 config.tray_icon_path 解析托盘图标；文件不存在则回退默认 icon。
+    返回绝对路径字符串，或 None（最终由 TrayController 画占位图）。
+    """
+    candidates = []
+    raw = ""
+    if cfg is not None:
+        raw = str(getattr(cfg, "tray_icon_path", "") or "").strip()
+    if raw:
+        p = Path(raw)
+        if p.is_absolute():
+            candidates.append(p)
+        else:
+            candidates.append(_app_dir() / raw)
+            candidates.append(Path.cwd() / raw)
+    # 默认回退
+    for rel in (DEFAULT_TRAY_ICON_REL, ICON_PATH, "assets/icon.png", "icon.png"):
+        candidates.append(_app_dir() / rel)
+    seen = set()
+    for c in candidates:
+        try:
+            key = str(c.resolve())
+        except Exception:
+            key = str(c)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            if c.is_file():
+                return str(c.resolve())
+        except Exception:
+            continue
+    return None
+
+
+def _autostart_task_command() -> str:
+    """构造开机自启任务 /TR 命令行。"""
+    from win_autostart import build_task_command_for_python
+
+    if getattr(sys, "frozen", False):
+        return f'"{sys.executable}"'
+    return build_task_command_for_python(str(Path(__file__).resolve()))
 
 
 class App(tb.Window):
@@ -135,6 +185,7 @@ class App(tb.Window):
                 "desktop_toast_auto_dismiss",
                 getattr(self.cfg, "notification_auto_close_seconds", 10),
             ),
+            popup_card_gap=getattr(self.cfg, "popup_card_gap", 12),
         )
         self.manager = BridgeManager(
             self.cfg,
@@ -163,7 +214,7 @@ class App(tb.Window):
         except Exception as e:
             print(f"[backup] mkdir failed: {e}")
 
-        icon_path = ICON_PATH if os.path.exists(ICON_PATH) else None
+        icon_path = resolve_tray_icon_path(self.cfg)
         self.tray = TrayController(
             title="NekoLink",
             on_restore=self.restore_from_tray,
@@ -175,6 +226,12 @@ class App(tb.Window):
         self.ui = {}  # widgets needing i18n refresh
 
         self._build_ui()
+        # 窗口图标（仅 .ico 可靠）
+        try:
+            if icon_path and str(icon_path).lower().endswith(".ico"):
+                self.iconbitmap(icon_path)
+        except Exception:
+            pass
         self.apply_i18n()
 
         self._flush_logs()
@@ -183,32 +240,117 @@ class App(tb.Window):
         self.protocol("WM_DELETE_WINDOW", self.on_close_to_tray)
 
     # ---------- UI ----------
+    def _make_hidden_scrolled(self, parent) -> ScrolledFrame:
+        """可配置页：隐藏滚动条；页面/滚动容器背景与全局 MAIN_BG 一致。"""
+        wrap = tb.Frame(parent)
+        wrap.pack(fill=BOTH, expand=True, padx=PAGE_PADX, pady=PAGE_PADY)
+        # 禁止 bootstyle=light（会刷成灰底）；内容区走全局 TFrame = PAGE_BG
+        sc = ScrolledFrame(wrap, autohide=False)
+        sc.pack(fill=BOTH, expand=True)
+        self._paint_page_bg(wrap)
+        self._paint_page_bg(sc)
+        try:
+            self._paint_page_bg(sc.container)
+        except Exception:
+            pass
+        try:
+            sc.hide_scrollbars()
+        except Exception:
+            pass
+        return sc
+
+    def _paint_page_bg(self, widget) -> None:
+        """仅统一页面/滚动容器背景，不改按钮/输入框等控件色。"""
+        if widget is None:
+            return
+        bg = PAGE_BG_COLOR
+        try:
+            widget.configure(style="TFrame")
+        except Exception:
+            pass
+        for key in ("background", "bg"):
+            try:
+                widget.configure(**{key: bg})
+                break
+            except Exception:
+                continue
+
+    def _enable_hidden_scroll(self, sc: ScrolledFrame) -> None:
+        """在子控件全部加入后再绑定滚轮，并再次对齐页面背景。"""
+        try:
+            sc.hide_scrollbars()
+        except Exception:
+            pass
+        try:
+            sc.enable_scrolling()
+        except Exception:
+            pass
+        self._paint_page_bg(sc)
+        try:
+            self._paint_page_bg(sc.container)
+        except Exception:
+            pass
+
+    def _show_tab(self, key: str) -> None:
+        if key not in self._pages:
+            return
+        self._current_tab = key
+        for k, fr in self._pages.items():
+            if k == key:
+                fr.pack(fill=BOTH, expand=True)
+            else:
+                fr.pack_forget()
+        for k, btn in self._tab_btns.items():
+            try:
+                btn.configure(bootstyle=("primary" if k == key else "secondary-outline"))
+            except Exception:
+                pass
+
     def _build_ui(self):
         root = tb.Frame(self, padding=(PAGE_PADX, PAGE_PADY))
         root.pack(fill=BOTH, expand=True)
 
+        # 状态行（配置路径 / 运行状态靠右）
         header = tb.Frame(root)
         header.pack(fill=X)
 
-        self.ui["lbl_header"] = tb.Label(header, text="", font=FONT_HEADER)
-        self.ui["lbl_header"].pack(side=LEFT)
+        self.ui["lbl_status"] = tb.Label(header, text="", bootstyle="danger")
+        self.ui["lbl_status"].pack(side=RIGHT)
 
-        # language selector (right)
-        lang_frame = tb.Frame(header)
-        lang_frame.pack(side=RIGHT, padx=(10, 0))
+        self.ui["lbl_cfg"] = tb.Label(header, text="", bootstyle="secondary")
+        self.ui["lbl_cfg"].pack(side=RIGHT, padx=(0, 12))
 
-        self.ui["lbl_lang"] = tb.Label(lang_frame, text="Lang")
+        # 顶部导航：🐾 NekoLink | 标签页 | Lang | 全局保存
+        top_bar = tb.Frame(root)
+        top_bar.pack(fill=X, pady=(8, 0))
+        self.ui["top_bar"] = top_bar
+
+        self.ui["lbl_header"] = tb.Label(
+            top_bar,
+            text="🐾 NekoLink",
+            font=FONT_BRAND,
+            foreground=TEXT_MAIN,
+        )
+        self.ui["lbl_header"].pack(side=LEFT, padx=(0, 16))
+
+        tabs_row = tb.Frame(top_bar)
+        tabs_row.pack(side=LEFT, fill=X, expand=True)
+
+        right_bar = tb.Frame(top_bar)
+        right_bar.pack(side=RIGHT)
+
+        self.ui["lbl_lang"] = tb.Label(right_bar, text="Lang")
         self.ui["lbl_lang"].pack(side=LEFT, padx=(0, 6))
 
         self.var_lang = tk.StringVar(value=i18n.lang_label(i18n.get_lang()))
         self.cmb_lang = tb.Combobox(
-            lang_frame,
+            right_bar,
             width=10,
             textvariable=self.var_lang,
             values=[i18n.lang_label("zh"), i18n.lang_label("en"), i18n.lang_label("ja")],
             state="readonly",
         )
-        self.cmb_lang.pack(side=LEFT)
+        self.cmb_lang.pack(side=LEFT, padx=(0, 8))
 
         def on_lang_change(_evt=None):
             label = self.var_lang.get().strip()
@@ -219,51 +361,95 @@ class App(tb.Window):
                     break
             i18n.set_lang(code)
             self.cfg.ui_lang = code
-            save_config(CONFIG_PATH, self.cfg)
+            # 仅切换界面语言，不落盘；点顶部【保存】才写入 config.json
             self.apply_i18n()
 
         self.cmb_lang.bind("<<ComboboxSelected>>", on_lang_change)
 
-        # status + config path
-        self.ui["lbl_status"] = tb.Label(header, text="", bootstyle="danger")
-        self.ui["lbl_status"].pack(side=RIGHT)
+        self.ui["btn_global_save"] = tb.Button(
+            right_bar, text=i18n.t("save"), bootstyle="primary", command=self.on_save
+        )
+        self.ui["btn_global_save"].pack(side=LEFT)
 
-        self.ui["lbl_cfg"] = tb.Label(header, text="", bootstyle="secondary")
-        self.ui["lbl_cfg"].pack(side=RIGHT, padx=(0, 12))
+        # 页面容器（替代 Notebook，便于与 Lang/保存同一行）
+        self.page_host = tb.Frame(root)
+        self.page_host.pack(fill=BOTH, expand=True, pady=(8, 0))
+        self._paint_page_bg(self.page_host)
 
-        # notebook
-        self.nb = tb.Notebook(root)
-        self.nb.pack(fill=BOTH, expand=True, pady=(10, 0))
+        self.tab_main = tb.Frame(self.page_host)
+        self.tab_devices = tb.Frame(self.page_host)
+        self.tab_dest = tb.Frame(self.page_host)
+        self.tab_filter = tb.Frame(self.page_host)
+        self.tab_misc = tb.Frame(self.page_host)
+        self.tab_history = tb.Frame(self.page_host)
+        self.tab_logs = tb.Frame(self.page_host)
 
-        self.tab_main = tb.Frame(self.nb)
-        self.tab_devices = tb.Frame(self.nb)
-        self.tab_dest = tb.Frame(self.nb)
-        self.tab_filter = tb.Frame(self.nb)
-        self.tab_misc = tb.Frame(self.nb)
-        self.tab_history = tb.Frame(self.nb)
-        self.tab_logs = tb.Frame(self.nb)
+        self._pages = {
+            "main": self.tab_main,
+            "devices": self.tab_devices,
+            "dest": self.tab_dest,
+            "filter": self.tab_filter,
+            "misc": self.tab_misc,
+            "history": self.tab_history,
+            "logs": self.tab_logs,
+        }
+        for fr in self._pages.values():
+            self._paint_page_bg(fr)
+        self._tab_keys = list(self._pages.keys())
+        self._tab_i18n = {
+            "main": "tab_main",
+            "devices": "tab_devices",
+            "dest": "tab_dest",
+            "filter": "tab_filter",
+            "misc": "tab_misc",
+            "history": "tab_history",
+            "logs": "tab_logs",
+        }
+        self._tab_btns = {}
+        for key in self._tab_keys:
+            btn = tb.Button(
+                tabs_row,
+                text=i18n.t(self._tab_i18n[key]),
+                bootstyle="secondary-outline",
+                command=lambda k=key: self._show_tab(k),
+            )
+            btn.pack(side=LEFT, padx=(0, 4))
+            self._tab_btns[key] = btn
 
-        self.nb.add(self.tab_main, text="Main")
-        self.nb.add(self.tab_devices, text="Devices")
-        self.nb.add(self.tab_dest, text="Destinations")
-        self.nb.add(self.tab_filter, text="Block Keywords")
-        self.nb.add(self.tab_misc, text="Misc")
-        self.nb.add(self.tab_history, text="History")
-        self.nb.add(self.tab_logs, text="Logs")
+        # 兼容旧代码里的 self.nb.select(...)
+        class _NbCompat:
+            def __init__(self, app: "App"):
+                self._app = app
+
+            def select(self, tab_frame):
+                for k, fr in self._app._pages.items():
+                    if fr is tab_frame:
+                        self._app._show_tab(k)
+                        return
+
+        self.nb = _NbCompat(self)
 
         self._build_main()
         self._build_devices()
-        self._build_dest()     # ✅ scroll + bottom save
+        self._build_dest()
         self._build_filter()
         self._build_misc()
         self._build_history()
         self._build_logs()
-        # 构建后再次对齐主题，避免部分控件沿用主题默认灰底
         apply_global_theme(self)
+        # 主题应用后再刷一遍页面底，避免 ScrolledFrame/子 Frame 被主题刷灰
+        self._paint_page_bg(self.page_host)
+        for fr in self._pages.values():
+            self._paint_page_bg(fr)
+        self._show_tab("main")
 
     def apply_i18n(self):
         self.title(i18n.t("app_title"))
-        self.ui["lbl_header"].config(text=i18n.t("header_line"))
+        self.ui["lbl_header"].config(
+            text=i18n.t("header_brand"),
+            font=FONT_BRAND,
+            foreground=TEXT_MAIN,
+        )
         self.ui["lbl_cfg"].config(text=f"{i18n.t('config_path')}: {CONFIG_PATH}")
 
         if self.running:
@@ -271,17 +457,13 @@ class App(tb.Window):
         else:
             self.ui["lbl_status"].config(text=i18n.t("status_stopped"), bootstyle="danger")
 
-        self.nb.tab(self.tab_main, text=i18n.t("tab_main"))
-        self.nb.tab(self.tab_devices, text=i18n.t("tab_devices"))
-        self.nb.tab(self.tab_dest, text=i18n.t("tab_dest"))
-        self.nb.tab(self.tab_filter, text=i18n.t("tab_filter"))
-        self.nb.tab(self.tab_misc, text=i18n.t("tab_misc"))
-        self.nb.tab(self.tab_history, text=i18n.t("tab_history"))
-        self.nb.tab(self.tab_logs, text=i18n.t("tab_logs"))
+        for key, btn in getattr(self, "_tab_btns", {}).items():
+            btn.configure(text=i18n.t(self._tab_i18n[key]))
+        if "btn_global_save" in self.ui:
+            self.ui["btn_global_save"].config(text=i18n.t("save"))
 
         # main
         self.ui["lbl_run_control"].config(text=i18n.t("run_control"))
-        self.ui["btn_save_all"].config(text=i18n.t("save_all"))
         self.ui["btn_start"].config(text=i18n.t("start"))
         self.ui["btn_stop"].config(text=i18n.t("stop"))
         self.ui["lbl_dedup"].config(text=i18n.t("dedup_sec"))
@@ -307,7 +489,6 @@ class App(tb.Window):
         self.ui["btn_add_addr"].config(text=i18n.t("add"))
         self.ui["btn_remove_addr"].config(text=i18n.t("remove_selected"))
         self.ui["txt_scan_hint"].config(text=i18n.t("scan_hint"))
-        self.ui["btn_save_devices"].config(text=i18n.t("save"))
         self.ui["lbl_device_alias"].config(text=i18n.t("device_alias"))
         self.ui["btn_set_device_alias"].config(text=i18n.t("set_alias"))
         if "dev_tree" in self.ui:
@@ -321,7 +502,6 @@ class App(tb.Window):
         self.ui["lbl_map_name"].config(text=i18n.t("col_app_name"))
         self.ui["btn_map_upsert"].config(text=i18n.t("map_upsert"))
         self.ui["btn_map_remove"].config(text=i18n.t("remove_selected"))
-        self.ui["btn_save_history"].config(text=i18n.t("save"))
         if "map_tree" in self.ui:
             self.ui["map_tree"].heading("bundle", text=i18n.t("col_bundle_id"))
             self.ui["map_tree"].heading("name", text=i18n.t("col_app_name"))
@@ -340,7 +520,6 @@ class App(tb.Window):
         self.ui["chk_block_ci"].config(text=i18n.t("case_insensitive"))
         self.ui["btn_add_block"].config(text=i18n.t("add"))
         self.ui["btn_remove_block"].config(text=i18n.t("remove_selected"))
-        self.ui["btn_save_filter"].config(text=i18n.t("save"))
 
         # misc
         self.ui["lbl_misc_title"].config(text=i18n.t("misc_title"))
@@ -379,6 +558,10 @@ class App(tb.Window):
             self.ui["lbl_max_preview"].config(text=i18n.t("misc_max_preview"))
         if "lbl_max_pop" in self.ui:
             self.ui["lbl_max_pop"].config(text=i18n.t("misc_max_pop"))
+        if "lbl_card_gap" in self.ui:
+            self.ui["lbl_card_gap"].config(text=i18n.t("misc_card_gap"))
+            self.ui["lbl_card_gap_hint"].config(text=i18n.t("misc_card_gap_hint"))
+            self.ui["lbl_card_gap_restart"].config(text=i18n.t("misc_restart_hint"))
         if "lbl_auto_close" in self.ui:
             self.ui["lbl_auto_close"].config(text=i18n.t("misc_auto_close"))
             self.ui["lbl_auto_close_hint"].config(text=i18n.t("misc_auto_close_hint"))
@@ -392,6 +575,13 @@ class App(tb.Window):
             self.ui["chk_auto_backup"].config(text=i18n.t("misc_auto_backup"))
             self.ui["lbl_auto_backup_hint"].config(text=i18n.t("misc_auto_backup_hint"))
             self.ui["lbl_auto_backup_path"].config(text=i18n.t("misc_auto_backup_path"))
+        if "chk_auto_start" in self.ui:
+            self.ui["chk_auto_start"].config(text=i18n.t("misc_auto_start"))
+            self.ui["lbl_auto_start_hint"].config(text=i18n.t("misc_auto_start_hint"))
+        if "lbl_tray_icon" in self.ui:
+            self.ui["lbl_tray_icon"].config(text=i18n.t("misc_tray_icon"))
+            self.ui["btn_tray_icon_browse"].config(text=i18n.t("browse"))
+            self.ui["lbl_tray_icon_hint"].config(text=i18n.t("misc_tray_icon_hint"))
         if hasattr(self, "privacy_frm"):
             self.privacy_frm.configure(text=i18n.t("privacy_title"))
         if "chk_privacy_show_title" in self.ui:
@@ -399,7 +589,6 @@ class App(tb.Window):
             self.ui["lbl_privacy_show_title_hint"].config(text=i18n.t("privacy_show_title_hint"))
             self.ui["chk_privacy_show_msg"].config(text=i18n.t("privacy_show_msg"))
             self.ui["lbl_privacy_show_msg_hint"].config(text=i18n.t("privacy_show_msg_hint"))
-        self.ui["btn_save_misc"].config(text=i18n.t("save"))
 
         # history/logs
         self.ui["lbl_history_title"].config(text=i18n.t("history_title"))
@@ -409,10 +598,6 @@ class App(tb.Window):
             self.ui["btn_export_history"].config(text=i18n.t("history_export_all"))
         self.ui["lbl_logs_title"].config(text=i18n.t("tab_logs"))
         self.ui["btn_clear_logs"].config(text=i18n.t("clear"))
-
-        # destinations bottom save
-        if "btn_save_dest" in self.ui:
-            self.ui["btn_save_dest"].config(text=i18n.t("save"))
 
     # ---------- Tabs ----------
     def _build_main(self):
@@ -428,8 +613,6 @@ class App(tb.Window):
         btns = tb.Frame(left)
         btns.pack(anchor=W, pady=(0, 8))
 
-        self.ui["btn_save_all"] = tb.Button(btns, text="", bootstyle="secondary", command=self.on_save)
-        self.ui["btn_save_all"].pack(side=LEFT, padx=(0, 8))
         self.ui["btn_start"] = tb.Button(btns, text="", bootstyle="success", command=self.on_start)
         self.ui["btn_start"].pack(side=LEFT, padx=(0, 8))
         self.ui["btn_stop"] = tb.Button(btns, text="", bootstyle="danger", command=self.on_stop)
@@ -518,8 +701,7 @@ class App(tb.Window):
         self._last_payload: Optional[dict] = None
 
     def _build_devices(self):
-        frm = tb.Frame(self.tab_devices, padding=(PAGE_PADX, PAGE_PADY))
-        frm.pack(fill=BOTH, expand=True)
+        frm = self._make_hidden_scrolled(self.tab_devices)
 
         top = tb.Frame(frm)
         top.pack(fill=X, pady=(0, 10))
@@ -580,9 +762,7 @@ class App(tb.Window):
                 pass
 
         self.scan_box.bind("<Double-Button-1>", on_dbl_click)
-
-        self.ui["btn_save_devices"] = tb.Button(frm, text="", bootstyle="primary", command=self.on_save)
-        self.ui["btn_save_devices"].pack(anchor=SE, pady=(10, 0))
+        self._enable_hidden_scroll(frm)
 
     def _reload_device_tree(self):
         self.dev_tree.delete(*self.dev_tree.get_children())
@@ -615,19 +795,12 @@ class App(tb.Window):
             self.cfg.device_aliases[addr] = alias
         else:
             self.cfg.device_aliases.pop(addr, None)
-        self._persist_config(show_msg=False)
-        self.log(f"[UI] 设备别名已保存: {addr} -> {alias or '(空)'}")
+        # 仅更新界面与内存；点顶部【保存】才写入 config.json
+        self.log(f"[UI] 设备别名已更新（未落盘）: {addr} -> {alias or '(空)'}")
 
-    # ✅ Destinations: scrollable + fixed bottom Save
+    # ✅ Destinations: 隐藏滚动条 + 无页内保存
     def _build_dest(self):
-        outer = tb.Frame(self.tab_dest, padding=(PAGE_PADX, PAGE_PADY))
-        outer.pack(fill=BOTH, expand=True)
-
-        # scroll area
-        sc = ScrolledFrame(outer, autohide=True)
-        sc.pack(fill=BOTH, expand=True)
-
-        frm = sc
+        frm = self._make_hidden_scrolled(self.tab_dest)
 
         # Telegram
         tg = tb.Labelframe(frm, text="Telegram", padding=10)
@@ -794,18 +967,10 @@ class App(tb.Window):
         tb.Button(mail, text="Test", bootstyle="success", command=self.test_email).grid(
             row=6, column=1, sticky=W, pady=(8, 0)
         )
-
-        # bottom fixed bar
-        bottom = tb.Frame(outer)
-        bottom.pack(fill=X, pady=(10, 0))
-        tb.Separator(bottom).pack(fill=X, pady=(0, 8))
-
-        self.ui["btn_save_dest"] = tb.Button(bottom, text="", bootstyle="primary", command=self.on_save)
-        self.ui["btn_save_dest"].pack(side=RIGHT)
+        self._enable_hidden_scroll(frm)
 
     def _build_filter(self):
-        frm = tb.Frame(self.tab_filter, padding=(PAGE_PADX, PAGE_PADY))
-        frm.pack(fill=BOTH, expand=True)
+        frm = self._make_hidden_scrolled(self.tab_filter)
 
         self.ui["lbl_block_intro"] = tb.Label(frm, text="", font=("Segoe UI", 12, "bold"))
         self.ui["lbl_block_intro"].pack(anchor=W, pady=(0, 8))
@@ -828,13 +993,10 @@ class App(tb.Window):
         self.ui["btn_add_block"].pack(side=LEFT, padx=(0, 8))
         self.ui["btn_remove_block"] = tb.Button(ctl, text="", bootstyle="warning", command=self.remove_block)
         self.ui["btn_remove_block"].pack(side=LEFT)
-
-        self.ui["btn_save_filter"] = tb.Button(frm, text="", bootstyle="primary", command=self.on_save)
-        self.ui["btn_save_filter"].pack(anchor=SE, pady=(10, 0))
+        self._enable_hidden_scroll(frm)
 
     def _build_misc(self):
-        frm = tb.Frame(self.tab_misc, padding=(PAGE_PADX, PAGE_PADY))
-        frm.pack(fill=BOTH, expand=True)
+        frm = self._make_hidden_scrolled(self.tab_misc)
 
         self.ui["lbl_misc_title"] = tb.Label(frm, text="", font=("Segoe UI", 12, "bold"))
         self.ui["lbl_misc_title"].pack(anchor=W, pady=(0, 4))
@@ -962,6 +1124,32 @@ class App(tb.Window):
         )
         self.scl_max_pop.set(self.var_max_pop.get())
         self.scl_max_pop.pack(side=LEFT, fill=X, expand=True)
+
+        gap_row = tb.Frame(frm)
+        gap_row.pack(fill=X, anchor=W, pady=(4, 1))
+        self.ui["lbl_card_gap"] = tb.Label(gap_row, text="弹窗卡片垂直间距(px)")
+        self.ui["lbl_card_gap"].pack(side=LEFT, padx=(0, 8))
+        self.var_card_gap = tk.StringVar(
+            value=str(normalize_popup_card_gap(getattr(self.cfg, "popup_card_gap", 12)))
+        )
+        self.ent_card_gap = tb.Entry(gap_row, textvariable=self.var_card_gap, width=8)
+        self.ent_card_gap.pack(side=LEFT)
+        self.ui["lbl_card_gap_hint"] = tb.Label(
+            frm,
+            text="范围4‑60，控制多个桌面弹窗互相之间的空隙。",
+            bootstyle="secondary",
+            wraplength=520,
+            justify=LEFT,
+        )
+        self.ui["lbl_card_gap_hint"].pack(anchor=W, pady=(0, 1))
+        self.ui["lbl_card_gap_restart"] = tb.Label(
+            frm,
+            text="修改后需要重启程序生效",
+            bootstyle="secondary",
+            wraplength=520,
+            justify=LEFT,
+        )
+        self.ui["lbl_card_gap_restart"].pack(anchor=W, pady=(0, 3))
 
         close_row = tb.Frame(frm)
         close_row.pack(fill=X, anchor=W, pady=(0, 1))
@@ -1111,6 +1299,69 @@ class App(tb.Window):
         self.ent_auto_backup_path = tb.Entry(path_row, textvariable=self.var_auto_backup_path)
         self.ent_auto_backup_path.pack(side=LEFT, fill=X, expand=True)
 
+        # 开机自启动（默认关闭；保存时写入/删除计划任务）
+        autostart_frm = tb.Frame(frm)
+        autostart_frm.pack(fill=X, anchor=W, pady=(6, 3))
+        _auto_on = bool(
+            getattr(self.cfg, "auto_start", False)
+            or getattr(self.cfg, "autostart_enabled", False)
+        )
+        self.var_auto_start = tk.BooleanVar(value=_auto_on)
+        self.ui["chk_auto_start"] = tb.Checkbutton(
+            autostart_frm,
+            text="开机自动启动 NekoLink",
+            variable=self.var_auto_start,
+            bootstyle="round-toggle",
+        )
+        self.ui["chk_auto_start"].pack(anchor=W)
+        self.ui["lbl_auto_start_hint"] = tb.Label(
+            autostart_frm,
+            text="开启后程序随系统开机自动运行",
+            bootstyle="secondary",
+            wraplength=520,
+            justify=LEFT,
+        )
+        self.ui["lbl_auto_start_hint"].pack(anchor=W, pady=(0, 2))
+
+        # 状态栏 / 托盘图标路径
+        tray_frm = tb.Frame(frm)
+        tray_frm.pack(fill=X, anchor=W, pady=(4, 3))
+        tray_row = tb.Frame(tray_frm)
+        tray_row.pack(fill=X, anchor=W)
+        self.ui["lbl_tray_icon"] = tb.Label(tray_row, text="状态栏图标")
+        self.ui["lbl_tray_icon"].pack(side=LEFT, padx=(0, 8))
+        self.var_tray_icon_path = tk.StringVar(
+            value=str(getattr(self.cfg, "tray_icon_path", DEFAULT_TRAY_ICON_REL) or DEFAULT_TRAY_ICON_REL)
+        )
+        self.ent_tray_icon_path = tb.Entry(tray_row, textvariable=self.var_tray_icon_path)
+        self.ent_tray_icon_path.pack(side=LEFT, fill=X, expand=True, padx=(0, 8))
+
+        def _browse_tray_icon():
+            path = filedialog.askopenfilename(
+                title=i18n.t("misc_tray_icon"),
+                filetypes=[
+                    ("Icons / Images", "*.ico;*.png;*.jpg;*.jpeg;*.bmp;*.webp"),
+                    ("ICO", "*.ico"),
+                    ("PNG", "*.png"),
+                    ("All", "*.*"),
+                ],
+            )
+            if path:
+                self.var_tray_icon_path.set(path)
+
+        self.ui["btn_tray_icon_browse"] = tb.Button(
+            tray_row, text=i18n.t("browse"), bootstyle="secondary-outline", command=_browse_tray_icon
+        )
+        self.ui["btn_tray_icon_browse"].pack(side=LEFT)
+        self.ui["lbl_tray_icon_hint"] = tb.Label(
+            tray_frm,
+            text="修改状态栏图标后需要重启程序生效",
+            bootstyle="secondary",
+            wraplength=520,
+            justify=LEFT,
+        )
+        self.ui["lbl_tray_icon_hint"].pack(anchor=W, pady=(2, 0))
+
         def _normalize_preview_entry():
             val = normalize_max_preview_chars(self.var_max_preview.get())
             self.var_max_preview.set(str(val))
@@ -1189,9 +1440,7 @@ class App(tb.Window):
                 self.manager.cfg.enable_windows_toast = bool(self.var_win_toast.get())
 
         self.var_win_toast.trace_add("write", lambda *_: _on_toast_toggle())
-
-        self.ui["btn_save_misc"] = tb.Button(frm, text="", bootstyle="primary", command=self.on_save)
-        self.ui["btn_save_misc"].pack(anchor=SE, pady=(6, 0))
+        self._enable_hidden_scroll(frm)
 
     def _build_history(self):
         frm = tb.Frame(self.tab_history, padding=12)
@@ -1329,8 +1578,6 @@ class App(tb.Window):
         self.ui["btn_map_upsert"].pack(side=LEFT, padx=(0, 8))
         self.ui["btn_map_remove"] = tb.Button(btns, text="删除所选", bootstyle="warning", command=self.remove_app_map)
         self.ui["btn_map_remove"].pack(side=LEFT)
-        self.ui["btn_save_history"] = tb.Button(map_frm, text="保存", bootstyle="primary", command=self.on_save)
-        self.ui["btn_save_history"].pack(anchor=SE, pady=(10, 0))
 
     def _reload_app_map_tree(self):
         self.map_tree.delete(*self.map_tree.get_children())
@@ -1728,6 +1975,30 @@ class App(tb.Window):
             self.log(f"[CONFIG] hot-reload failed, keep previous runtime config: {e}")
             return False
 
+    def _apply_autostart(self, enabled: bool, prev_enabled: bool) -> Optional[str]:
+        """
+        根据 auto_start 写入/删除 Windows 计划任务。
+        返回给用户看的提示文案；无变更返回 None；失败返回错误文案。
+        """
+        if enabled == prev_enabled:
+            return None
+        try:
+            from win_autostart import disable, enable
+
+            if enabled:
+                res = enable(_autostart_task_command())
+            else:
+                res = disable()
+            if res.ok:
+                return i18n.t("auto_start_on") if enabled else i18n.t("auto_start_off")
+            return res.message or str(res)
+        except Exception as e:
+            try:
+                self.log(f"[autostart] failed: {e}")
+            except Exception:
+                pass
+            return str(e)
+
     def _persist_config(self, show_msg: bool = True):
         secs, err = parse_notification_auto_close_seconds(
             self.var_auto_close.get() if hasattr(self, "var_auto_close") else "8"
@@ -1744,18 +2015,39 @@ class App(tb.Window):
                 )
             )
         self.var_auto_close.set(str(secs))
+        # 垂直间距：非法输入回退默认 12 并回填输入框
+        if hasattr(self, "var_card_gap"):
+            gap = normalize_popup_card_gap(self.var_card_gap.get())
+            self.var_card_gap.set(str(gap))
+        prev_auto = bool(
+            getattr(self.cfg, "auto_start", False)
+            or getattr(self.cfg, "autostart_enabled", False)
+        )
         cfg = self.collect_config()
         save_config(CONFIG_PATH, cfg)
         ok = self.reload_runtime_config(cfg)
         # 刷新映射表 UI 显示（不重建历史列表）
         self._reload_app_map_tree()
+        auto_tip = None
+        try:
+            auto_tip = self._apply_autostart(bool(getattr(cfg, "auto_start", False)), prev_auto)
+        except Exception as e:
+            auto_tip = str(e)
+            try:
+                self.log(f"[autostart] sync error: {e}")
+            except Exception:
+                pass
         if show_msg:
+            extra = f"\n{auto_tip}" if auto_tip else ""
             if ok:
-                messagebox.showinfo(i18n.t("ok"), f"{i18n.t('saved_hot_reload')}\n{CONFIG_PATH}")
+                messagebox.showinfo(
+                    i18n.t("ok"),
+                    f"{i18n.t('config_saved')}\n{i18n.t('saved_restart_hint')}{extra}\n{CONFIG_PATH}",
+                )
             else:
                 messagebox.showwarning(
                     i18n.t("fail"),
-                    f"{i18n.t('saved_to')}\n{CONFIG_PATH}\n(热加载失败，请查看日志)",
+                    f"{i18n.t('config_saved')}\n{CONFIG_PATH}\n(热加载失败，请查看日志){extra}",
                 )
 
     def on_start(self):
@@ -2256,7 +2548,13 @@ class App(tb.Window):
             code_separate_prefix=self.cfg.code_separate_prefix,
 
             history_limit=self.safe_int(self.var_history_limit.get(), self.cfg.history_limit),
-            autostart_enabled=self.cfg.autostart_enabled,
+            auto_start=bool(self.var_auto_start.get()) if hasattr(self, "var_auto_start") else False,
+            autostart_enabled=bool(self.var_auto_start.get()) if hasattr(self, "var_auto_start") else False,
+            tray_icon_path=(
+                self.var_tray_icon_path.get().strip()
+                if hasattr(self, "var_tray_icon_path")
+                else str(getattr(self.cfg, "tray_icon_path", DEFAULT_TRAY_ICON_REL) or DEFAULT_TRAY_ICON_REL)
+            ),
 
             show_battery_in_message=bool(self.var_show_battery.get()),
             enable_windows_toast=bool(self.var_win_toast.get()),
@@ -2265,6 +2563,9 @@ class App(tb.Window):
             notification_font_size=self._notif_font_key_from_label(self.var_notif_font.get()),
             max_preview_chars=normalize_max_preview_chars(self.var_max_preview.get()),
             max_pop_notification=normalize_max_pop_notification(self.var_max_pop.get()),
+            popup_card_gap=normalize_popup_card_gap(
+                self.var_card_gap.get() if hasattr(self, "var_card_gap") else 12
+            ),
             notification_auto_close_seconds=normalize_notification_auto_close_seconds(
                 self.var_auto_close.get() if hasattr(self, "var_auto_close") else 10
             ),
