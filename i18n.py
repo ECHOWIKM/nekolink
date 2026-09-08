@@ -197,9 +197,9 @@ DICT: Dict[str, Dict[str, str]] = {
     },
     "app_map_title": {"zh": "应用名称映射", "en": "App name mapping", "ja": "アプリ名マッピング"},
     "app_map_hint": {
-        "zh": "双击上方历史记录可快速填入 Bundle ID。保存后写入 config.json。",
-        "en": "Double-click a history row to fill Bundle ID. Saved to config.json.",
-        "ja": "履歴をダブルクリックで Bundle ID を入力。config.json に保存されます。",
+        "zh": "单击上方历史记录可快速填入 Bundle ID。保存后写入 config.json。",
+        "en": "Click a history row to fill Bundle ID. Saved to config.json.",
+        "ja": "履歴行をクリックして Bundle ID を入力。config.json に保存されます。",
     },
     "map_upsert": {"zh": "添加/更新", "en": "Add / Update", "ja": "追加/更新"},
     "fill_bundle_id": {"zh": "请填写 Bundle ID", "en": "Please enter Bundle ID", "ja": "Bundle ID を入力してください"},

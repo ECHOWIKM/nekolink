@@ -169,8 +169,8 @@ class App(tb.Window):
         i18n.set_lang(getattr(self.cfg, "ui_lang", "zh"))
 
         self.title(i18n.t("app_title"))
-        self.geometry("1100x720")
-        self.minsize(980, 620)
+        self.geometry("1300x1000")
+        self.minsize(1100, 850)
 
         self.running = False
         # 内存历史列表（供导出）；上限 MAX_HISTORY_COUNT，超限丢弃最旧
@@ -1612,15 +1612,21 @@ class App(tb.Window):
     def _build_history(self):
         frm = tb.Frame(self.tab_history, padding=12)
         frm.pack(fill=BOTH, expand=True)
+        frm.grid_rowconfigure(1, weight=1)
+        frm.grid_columnconfigure(0, weight=1)
 
         top = tb.Frame(frm)
-        top.pack(fill=X, pady=(0, 8))
+        top.grid(row=0, column=0, sticky=EW, pady=(0, 8))
 
         self.ui["lbl_history_title"] = tb.Label(top, text="", font=("Segoe UI", 12, "bold"))
         self.ui["lbl_history_title"].pack(side=LEFT)
 
         self.ui["btn_clear_history"] = tb.Button(top, text="", bootstyle="warning", command=self.clear_history)
         self.ui["btn_clear_history"].pack(side=RIGHT, padx=(8, 0))
+        self.ui["btn_history_global_save"] = tb.Button(
+            top, text="💾全局保存", bootstyle="primary", command=self.save_app_map_global
+        )
+        self.ui["btn_history_global_save"].pack(side=RIGHT, padx=(8, 0))
         self.ui["btn_export_history"] = tb.Button(
             top, text="导出全部历史消息", bootstyle="info", command=self.export_all_history
         )
@@ -1640,17 +1646,18 @@ class App(tb.Window):
         self.tree.column("title", width=220, anchor=W)
         self.tree.column("msg", width=280, anchor=W)
         self.tree.column("codes", width=120, anchor=W)
-        self.tree.pack(fill=BOTH, expand=True, pady=(0, 10))
+        self.tree.grid(row=1, column=0, sticky=NSEW, pady=(0, 10))
+        self.tree.bind("<<TreeviewSelect>>", self._on_history_row_click)
         self.tree.bind("<Double-1>", self._on_history_dblclick)
 
         map_frm = tb.Labelframe(frm, text="应用名称映射", padding=10)
-        map_frm.pack(fill=X)
+        map_frm.grid(row=2, column=0, sticky=EW)
 
         self.ui["lbl_app_map"] = tb.Label(map_frm, text="应用名称映射", font=("Segoe UI", 11, "bold"))
         self.ui["lbl_app_map"].pack(anchor=W)
         self.ui["lbl_map_hint"] = tb.Label(
             map_frm,
-            text="双击上方历史可填入 Bundle ID；可为每个 App 选定专属提示音。保存后写入 config.json。",
+            text="单击上方历史可填入 Bundle ID；可为每个 App 选定专属提示音。保存后写入 config.json。",
             bootstyle="secondary",
         )
         self.ui["lbl_map_hint"].pack(anchor=W, pady=(0, 8))
@@ -1727,7 +1734,7 @@ class App(tb.Window):
         self.ui["cmb_map_sound"].pack(side=LEFT)
         self.ui["lbl_map_sound_hint"] = tb.Label(
             map_frm,
-            text="双击历史填入包名后，在此选定专属 wav；选「使用全局默认」则走杂项全局音效",
+            text="单击历史填入包名后，在此选定专属 wav；选「使用全局默认」则走杂项全局音效",
             bootstyle="secondary",
         )
         self.ui["lbl_map_sound_hint"].pack(anchor=W, pady=(0, 4))
@@ -1788,21 +1795,12 @@ class App(tb.Window):
         self.var_map_icon.set(self._map_icon_paths.get(bundle_id, ""))
         self._set_map_sound_var(bundle_id)
 
-    def _on_history_dblclick(self, _evt=None):
+    def _on_history_row_click(self, _evt=None):
+        """单击历史行：将 Bundle ID 填入下方应用映射表单。"""
         sel = self.tree.selection()
         if not sel:
             return
         raw = self._hist_raw.get(sel[0], {})
-        self._show_notification_detail(
-            resolve_raw_title(raw),
-            resolve_raw_msg(raw),
-            meta={
-                "time": raw.get("time") or "",
-                "app": raw.get("app_name") or "",
-                "device": raw.get("device_name") or "",
-            },
-        )
-        # 顺带填充应用映射表（旧行为保留）
         bundle_id = raw.get("app") or ""
         if not bundle_id:
             return
@@ -1812,6 +1810,38 @@ class App(tb.Window):
         self.var_map_block.set(bundle_id in block_set)
         self.var_map_icon.set((getattr(self.cfg, "app_icon_map", {}) or {}).get(bundle_id, ""))
         self._set_map_sound_var(bundle_id)
+
+    def _on_history_dblclick(self, _evt=None):
+        """双击历史行：弹出完整通知详情（与单击填入 Bundle ID 互不干扰）。"""
+        sel = self.tree.selection()
+        if not sel:
+            return
+        raw = self._hist_raw.get(sel[0], {})
+        if not raw:
+            return
+        self._show_notification_detail(
+            resolve_raw_title(raw),
+            resolve_raw_msg(raw),
+            meta={
+                "time": raw.get("time") or "",
+                "app": raw.get("app_name") or "",
+                "device": raw.get("device_name") or "",
+            },
+        )
+
+    def save_app_map_global(self):
+        """消息历史页：将全部应用映射写入 config.json。"""
+        if self.var_map_bundle.get().strip():
+            self.upsert_app_map()
+        try:
+            cfg = self.collect_config()
+            save_config(CONFIG_PATH, cfg)
+            self.cfg = cfg
+            self.reload_runtime_config(cfg)
+            self._reload_app_map_tree()
+            messagebox.showinfo("提示", "配置已全局保存到config.json")
+        except Exception as e:
+            messagebox.showerror(i18n.t("fail"), str(e))
 
     def _show_last_notification_detail(self, _evt=None):
         payload = getattr(self, "_last_payload", None) or {}
@@ -2010,14 +2040,15 @@ class App(tb.Window):
             "raw_title": raw_title,
             "raw_msg": raw_msg,
         }
-        self.history.append(hist_row)
+        self.history.insert(0, hist_row)
         while len(self.history) > MAX_HISTORY_COUNT:
-            self.history.pop(0)
+            self.history.pop()
+
         self._append_auto_backup_row(hist_row)
 
         iid = self.tree.insert(
             "",
-            "end",
+            0,
             values=(
                 t,
                 device_name,
@@ -2046,11 +2077,11 @@ class App(tb.Window):
         if nid:
             self._notif_to_iid[nid] = iid
 
-        # prune tree UI（与主页「历史条数上限」同步；内存列表另有 MAX_HISTORY_COUNT 保护）
+        # prune tree UI（最新在顶部；超出上限时删除末尾最旧行）
         limit = int(self.safe_int(self.var_history_limit.get(), default=self.cfg.history_limit))
         children = self.tree.get_children()
         if len(children) > max(50, limit):
-            for iid in children[: len(children) - limit]:
+            for iid in children[max(50, limit):]:
                 raw = self._hist_raw.pop(iid, {})
                 old_nid = raw.get("notif_id")
                 if old_nid:

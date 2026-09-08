@@ -12,6 +12,7 @@ import ttkbootstrap as tb
 from ttkbootstrap.constants import BOTH, BOTTOM, E, LEFT, RIGHT, W, X, Y
 
 import i18n
+from ui_icons import NavIcon, draw_card_icon_badge, draw_chevron_right, draw_status_dot
 from ui_theme import (
     CARD_BG,
     CARD_HOVER_BG,
@@ -31,25 +32,25 @@ from ui_theme import (
 
 APP_VERSION = "v1.0.0"
 
-# 导航项：(key, i18n_key, icon)
+# 导航项：(key, i18n_key, icon_key)
 NAV_ITEMS: List[Tuple[str, str, str]] = [
-    ("main", "nav_home", "🏠"),
-    ("history", "nav_history", "💬"),
-    ("dest", "nav_dest", "🎯"),
-    ("template", "nav_template", "📝"),
-    ("settings", "nav_settings", "⚙"),
-    ("logs", "nav_logs", "📋"),
+    ("main", "nav_home", "main"),
+    ("history", "nav_history", "history"),
+    ("dest", "nav_dest", "dest"),
+    ("template", "nav_template", "template"),
+    ("settings", "nav_settings", "settings"),
+    ("logs", "nav_logs", "logs"),
 ]
 
-# 设置卡片：(key, i18n_title, i18n_desc, icon)
+# 设置卡片：(key, i18n_title, i18n_desc, icon_key)
 SETTING_CARDS: List[Tuple[str, str, str, str]] = [
-    ("notification", "card_notification", "card_notification_desc", "🔔"),
-    ("desktop", "card_desktop", "card_desktop_desc", "🖥"),
-    ("push", "card_push", "card_push_desc", "✈"),
-    ("ble", "card_ble", "card_ble_desc", "📱"),
-    ("data", "card_data", "card_data_desc", "💾"),
-    ("sound", "card_sound", "card_sound_desc", "🔊"),
-    ("about", "card_about", "card_about_desc", "ℹ"),
+    ("notification", "card_notification", "card_notification_desc", "notification"),
+    ("desktop", "card_desktop", "card_desktop_desc", "desktop"),
+    ("push", "card_push", "card_push_desc", "push"),
+    ("ble", "card_ble", "card_ble_desc", "ble"),
+    ("data", "card_data", "card_data_desc", "data"),
+    ("sound", "card_sound", "card_sound_desc", "sound"),
+    ("about", "card_about", "card_about_desc", "about"),
 ]
 
 
@@ -138,8 +139,8 @@ class SettingCard(tk.Frame):
         pad = 2
         _round_rect(c, pad, pad, w - pad, h - pad, r, fill=bg, outline="#E8EDF4", width=1)
 
-        # 图标
-        c.create_text(28, h // 2 - 14, text=self._icon, font=(FONT_FAMILY, 18), anchor=W, fill=PRIMARY_BLUE)
+        icon_cx, icon_cy = 28, h // 2
+        draw_card_icon_badge(c, self._icon, icon_cx, icon_cy, circle_r=18, icon_size=20)
 
         # 标题
         c.create_text(56, h // 2 - 10, text=self._title, font=(FONT_FAMILY, 11, "bold"), anchor=W, fill=TEXT_MAIN)
@@ -161,7 +162,7 @@ class SettingCard(tk.Frame):
                 fill=TEXT_SECONDARY,
             )
             right_x -= 10
-        c.create_text(right_x, h // 2, text="›", font=(FONT_FAMILY, 16, "bold"), anchor=E, fill=PRIMARY_BLUE)
+        draw_chevron_right(c, right_x, h // 2)
 
 
 class Sidebar(tb.Frame):
@@ -201,7 +202,7 @@ class Sidebar(tb.Frame):
         nav_wrap = tb.Frame(self, padding=(8, 8))
         nav_wrap.pack(fill=BOTH, expand=True)
 
-        for key, i18n_key, icon in NAV_ITEMS:
+        for key, i18n_key, icon_key in NAV_ITEMS:
             row = tk.Frame(nav_wrap, bg=MAIN_BG, cursor="hand2")
             row.pack(fill=X, pady=2)
             inner = tk.Frame(row, bg=MAIN_BG, cursor="hand2")
@@ -210,8 +211,8 @@ class Sidebar(tb.Frame):
             bar = tk.Frame(inner, bg=MAIN_BG, width=3)
             bar.pack(side=LEFT, fill=Y)
 
-            icon_lbl = tk.Label(inner, text=icon, bg=MAIN_BG, fg=PRIMARY_BLUE, font=(FONT_FAMILY, 12), cursor="hand2")
-            icon_lbl.pack(side=LEFT, padx=(8, 8))
+            icon_widget = NavIcon(inner, icon_key, bg=MAIN_BG)
+            icon_widget.pack(side=LEFT, padx=(8, 8))
 
             text_lbl = tk.Label(inner, text="", bg=MAIN_BG, fg=TEXT_MAIN, font=FONT_NORMAL, anchor=W, cursor="hand2")
             text_lbl.pack(side=LEFT, fill=X, expand=True)
@@ -221,19 +222,23 @@ class Sidebar(tb.Frame):
                 widget.bind("<Enter>", lambda _e: self._hover_row(k, True))
                 widget.bind("<Leave>", lambda _e: self._hover_row(k, False))
 
-            for w in (row, inner, bar, icon_lbl, text_lbl):
+            for w in (row, inner, bar, icon_widget, text_lbl):
                 _bind_all(w)
 
             self._nav_btns[key] = row
             self._ui[f"nav_{key}"] = text_lbl
-            self._ui[f"nav_icon_{key}"] = icon_lbl
+            self._ui[f"nav_icon_{key}"] = icon_widget
             self._ui[f"nav_bar_{key}"] = bar
             self._ui[f"nav_inner_{key}"] = inner
 
         footer = tb.Frame(self, padding=(16, 12))
         footer.pack(fill=X, side=BOTTOM)
-        self._ui["lbl_run_status"] = tb.Label(footer, text="", font=FONT_SMALL, bootstyle="success")
-        self._ui["lbl_run_status"].pack(anchor=W)
+        run_row = tk.Frame(footer, bg=MAIN_BG)
+        run_row.pack(anchor=W, fill=X)
+        self._run_dot = tk.Canvas(run_row, width=10, height=14, bg=MAIN_BG, highlightthickness=0, bd=0)
+        self._run_dot.pack(side=LEFT)
+        self._ui["lbl_run_status"] = tb.Label(run_row, text="", font=FONT_SMALL, bootstyle="secondary")
+        self._ui["lbl_run_status"].pack(side=LEFT, anchor=W)
         self._ui["lbl_ble_status"] = tb.Label(footer, text="", font=FONT_SMALL, bootstyle="secondary")
         self._ui["lbl_ble_status"].pack(anchor=W, pady=(2, 0))
         self._ui["lbl_version"] = tb.Label(footer, text=APP_VERSION, font=FONT_SMALL, bootstyle="secondary")
@@ -249,15 +254,19 @@ class Sidebar(tb.Frame):
         self._paint_row(key, bg, PRIMARY_BLUE if enter else TEXT_MAIN)
 
     def _paint_row(self, key: str, bg: str, fg: str) -> None:
-        for suffix in ("", "_icon", "_inner"):
+        icon_color = PRIMARY_BLUE if key == self._current or fg == PRIMARY_BLUE else TEXT_SECONDARY
+        for suffix in ("", "_inner"):
             w = self._ui.get(f"nav_{key}{suffix}" if suffix else f"nav_{key}")
             if w and isinstance(w, (tk.Label, tk.Frame)):
                 try:
                     w.configure(bg=bg)
                     if isinstance(w, tk.Label):
-                        w.configure(fg=fg if "icon" not in (suffix or "") else PRIMARY_BLUE)
+                        w.configure(fg=fg)
                 except Exception:
                     pass
+        icon_w = self._ui.get(f"nav_icon_{key}")
+        if isinstance(icon_w, NavIcon):
+            icon_w.set_style(bg, icon_color)
         bar = self._ui.get(f"nav_bar_{key}")
         if bar:
             try:
@@ -294,12 +303,19 @@ class Sidebar(tb.Frame):
 
     def set_run_status(self, running: bool) -> None:
         lbl = self._ui.get("lbl_run_status")
+        dot = getattr(self, "_run_dot", None)
         if not lbl:
             return
         if running:
             lbl.configure(text=i18n.t("status_running"), bootstyle="success")
+            if dot:
+                dot.delete("all")
+                draw_status_dot(dot, 5, 7, "#22c55e", 3.5)
         else:
             lbl.configure(text=i18n.t("status_stopped"), bootstyle="secondary")
+            if dot:
+                dot.delete("all")
+                draw_status_dot(dot, 5, 7, TEXT_SECONDARY, 3.5)
 
     def set_ble_status(self, connected: bool, detail: str = "") -> None:
         lbl = self._ui.get("lbl_ble_status")
