@@ -63,12 +63,21 @@ from sound_helper import (
 )
 from ui_theme import (
     FONT_BRAND,
+    FONT_TITLE,
     MAIN_BG,
     PAGE_BG_COLOR,
     PAGE_PADX,
     PAGE_PADY,
     TEXT_MAIN,
+    TEXT_SECONDARY,
     apply_global_theme,
+)
+from ui_shell import (
+    APP_VERSION,
+    SETTING_CARDS,
+    Sidebar,
+    apply_sidebar_styles,
+    build_settings_card_grid,
 )
 
 CONFIG_PATH = get_config_path()
@@ -291,57 +300,150 @@ class App(tb.Window):
         except Exception:
             pass
 
-    def _show_tab(self, key: str) -> None:
+    def _show_page(self, key: str) -> None:
         if key not in self._pages:
             return
-        self._current_tab = key
+        self._current_page = key
         for k, fr in self._pages.items():
             if k == key:
                 fr.pack(fill=BOTH, expand=True)
             else:
                 fr.pack_forget()
-        for k, btn in self._tab_btns.items():
-            try:
-                btn.configure(bootstyle=("primary" if k == key else "secondary-outline"))
-            except Exception:
-                pass
+        if hasattr(self, "sidebar"):
+            self.sidebar.set_active(key)
+        if key == "settings":
+            self._show_settings_hub()
+
+    def _show_tab(self, key: str) -> None:
+        """兼容旧调用。"""
+        self._show_page(key)
+
+    def _on_sidebar_nav(self, key: str) -> None:
+        self._show_page(key)
+
+    def _show_settings_hub(self) -> None:
+        self._current_setting_panel = None
+        if hasattr(self, "_settings_hub_frame"):
+            self._settings_hub_frame.pack(fill=BOTH, expand=True)
+        for fr in getattr(self, "_setting_panel_frames", {}).values():
+            fr.pack_forget()
+
+    def _show_setting_panel(self, key: str) -> None:
+        if key not in getattr(self, "_setting_panel_frames", {}):
+            return
+        self._current_setting_panel = key
+        if hasattr(self, "_settings_hub_frame"):
+            self._settings_hub_frame.pack_forget()
+        for k, fr in self._setting_panel_frames.items():
+            if k == key:
+                fr.pack(fill=BOTH, expand=True)
+            else:
+                fr.pack_forget()
 
     def _build_ui(self):
-        root = tb.Frame(self, padding=(PAGE_PADX, PAGE_PADY))
-        root.pack(fill=BOTH, expand=True)
+        shell = tb.Frame(self)
+        shell.pack(fill=BOTH, expand=True)
+        self._paint_page_bg(shell)
 
-        # 状态行（配置路径 / 运行状态靠右）
-        header = tb.Frame(root)
+        self.sidebar = Sidebar(shell, on_nav=self._on_sidebar_nav)
+        self.sidebar.pack(side=LEFT, fill=Y)
+        apply_sidebar_styles(self)
+
+        self.content_host = tb.Frame(shell)
+        self.content_host.pack(side=LEFT, fill=BOTH, expand=True)
+        self._paint_page_bg(self.content_host)
+
+        self.page_host = tb.Frame(self.content_host)
+        self.page_host.pack(fill=BOTH, expand=True)
+        self._paint_page_bg(self.page_host)
+
+        self.tab_main = tb.Frame(self.page_host)
+        self.tab_history = tb.Frame(self.page_host)
+        self.tab_dest = tb.Frame(self.page_host)
+        self.tab_template = tb.Frame(self.page_host)
+        self.tab_settings = tb.Frame(self.page_host)
+        self.tab_logs = tb.Frame(self.page_host)
+        # 设置子面板宿主（devices/filter 仅作子页内嵌）
+        self.tab_devices = tb.Frame(self)
+        self.tab_filter = tb.Frame(self)
+
+        self._pages = {
+            "main": self.tab_main,
+            "history": self.tab_history,
+            "dest": self.tab_dest,
+            "template": self.tab_template,
+            "settings": self.tab_settings,
+            "logs": self.tab_logs,
+        }
+        for fr in self._pages.values():
+            self._paint_page_bg(fr)
+
+        self._setting_panel_frames = {}
+        self._settings_cards = {}
+        self._current_page = "main"
+        self._current_setting_panel = None
+
+        self._build_main()
+        self._build_dest()
+        self._build_template()
+        self._build_history()
+        self._build_logs()
+        self._build_settings_hub()
+        self._build_settings_panels()
+
+        class _NbCompat:
+            def __init__(self, app: "App"):
+                self._app = app
+
+            def select(self, tab_frame):
+                for k, fr in self._app._pages.items():
+                    if fr is tab_frame:
+                        self._app._show_page(k)
+                        return
+                # 兼容旧 tab_history 等直接引用
+                legacy = {
+                    getattr(self._app, "tab_history", None): "history",
+                    getattr(self._app, "tab_main", None): "main",
+                    getattr(self._app, "tab_dest", None): "dest",
+                    getattr(self._app, "tab_logs", None): "logs",
+                }
+                key = legacy.get(tab_frame)
+                if key:
+                    self._app._show_page(key)
+
+        self.nb = _NbCompat(self)
+
+        apply_global_theme(self)
+        self._paint_page_bg(self.page_host)
+        for fr in self._pages.values():
+            self._paint_page_bg(fr)
+        self._show_page("main")
+        self._update_sidebar_status()
+
+    def _build_settings_hub(self):
+        self._settings_hub_frame = tb.Frame(self.tab_settings)
+        self._settings_hub_frame.pack(fill=BOTH, expand=True)
+
+        header = tb.Frame(self._settings_hub_frame, padding=(24, 20, 24, 8))
         header.pack(fill=X)
+        top_row = tb.Frame(header)
+        top_row.pack(fill=X)
 
-        self.ui["lbl_status"] = tb.Label(header, text="", bootstyle="danger")
-        self.ui["lbl_status"].pack(side=RIGHT)
-
-        self.ui["lbl_cfg"] = tb.Label(header, text="", bootstyle="secondary")
-        self.ui["lbl_cfg"].pack(side=RIGHT, padx=(0, 12))
-
-        # 顶部导航：🐾 NekoLink | 标签页 | Lang | 全局保存
-        top_bar = tb.Frame(root)
-        top_bar.pack(fill=X, pady=(8, 0))
-        self.ui["top_bar"] = top_bar
-
-        self.ui["lbl_header"] = tb.Label(
-            top_bar,
-            text="🐾 NekoLink",
-            font=FONT_BRAND,
-            foreground=TEXT_MAIN,
+        title_col = tb.Frame(top_row)
+        title_col.pack(side=LEFT, fill=X, expand=True)
+        self.ui["lbl_settings_title"] = tb.Label(
+            title_col, text=i18n.t("settings_title"), font=("Segoe UI", 18, "bold")
         )
-        self.ui["lbl_header"].pack(side=LEFT, padx=(0, 16))
+        self.ui["lbl_settings_title"].pack(anchor=W)
+        self.ui["lbl_settings_subtitle"] = tb.Label(
+            title_col, text=i18n.t("settings_subtitle"), bootstyle="secondary"
+        )
+        self.ui["lbl_settings_subtitle"].pack(anchor=W, pady=(4, 0))
 
-        tabs_row = tb.Frame(top_bar)
-        tabs_row.pack(side=LEFT, fill=X, expand=True)
-
-        right_bar = tb.Frame(top_bar)
+        right_bar = tb.Frame(top_row)
         right_bar.pack(side=RIGHT)
-
         self.ui["lbl_lang"] = tb.Label(right_bar, text="Lang")
         self.ui["lbl_lang"].pack(side=LEFT, padx=(0, 6))
-
         self.var_lang = tk.StringVar(value=i18n.lang_label(i18n.get_lang()))
         self.cmb_lang = tb.Combobox(
             right_bar,
@@ -361,147 +463,156 @@ class App(tb.Window):
                     break
             i18n.set_lang(code)
             self.cfg.ui_lang = code
-            # 仅切换界面语言，不落盘；点顶部【保存】才写入 config.json
             self.apply_i18n()
 
         self.cmb_lang.bind("<<ComboboxSelected>>", on_lang_change)
-
         self.ui["btn_global_save"] = tb.Button(
             right_bar, text=i18n.t("save"), bootstyle="primary", command=self.on_save
         )
         self.ui["btn_global_save"].pack(side=LEFT)
 
-        # 页面容器（替代 Notebook，便于与 Lang/保存同一行）
-        self.page_host = tb.Frame(root)
-        self.page_host.pack(fill=BOTH, expand=True, pady=(8, 0))
-        self._paint_page_bg(self.page_host)
+        grid_wrap, self._settings_cards = build_settings_card_grid(
+            self._settings_hub_frame, on_card_click=self._show_setting_panel
+        )
+        grid_wrap.pack(fill=BOTH, expand=True)
 
-        self.tab_main = tb.Frame(self.page_host)
-        self.tab_devices = tb.Frame(self.page_host)
-        self.tab_dest = tb.Frame(self.page_host)
-        self.tab_filter = tb.Frame(self.page_host)
-        self.tab_misc = tb.Frame(self.page_host)
-        self.tab_history = tb.Frame(self.page_host)
-        self.tab_logs = tb.Frame(self.page_host)
+    def _create_setting_panel(self, key: str, title_key: str, builder) -> tb.Frame:
+        panel = tb.Frame(self.tab_settings)
+        top = tb.Frame(panel, padding=(24, 16, 24, 0))
+        top.pack(fill=X)
+        self.ui[f"btn_back_{key}"] = tb.Button(
+            top, text=i18n.t("settings_back"), bootstyle="link", command=self._show_settings_hub
+        )
+        self.ui[f"btn_back_{key}"].pack(side=LEFT)
+        self.ui[f"lbl_panel_{key}"] = tb.Label(
+            top, text=i18n.t(title_key), font=("Segoe UI", 14, "bold")
+        )
+        self.ui[f"lbl_panel_{key}"].pack(side=LEFT, padx=(8, 0))
+        frm = self._make_hidden_scrolled(panel)
+        builder(frm)
+        self._enable_hidden_scroll(frm)
+        return panel
 
-        self._pages = {
-            "main": self.tab_main,
-            "devices": self.tab_devices,
-            "dest": self.tab_dest,
-            "filter": self.tab_filter,
-            "misc": self.tab_misc,
-            "history": self.tab_history,
-            "logs": self.tab_logs,
-        }
-        for fr in self._pages.values():
-            self._paint_page_bg(fr)
-        self._tab_keys = list(self._pages.keys())
-        self._tab_i18n = {
-            "main": "tab_main",
-            "devices": "tab_devices",
-            "dest": "tab_dest",
-            "filter": "tab_filter",
-            "misc": "tab_misc",
-            "history": "tab_history",
-            "logs": "tab_logs",
-        }
-        self._tab_btns = {}
-        for key in self._tab_keys:
-            btn = tb.Button(
-                tabs_row,
-                text=i18n.t(self._tab_i18n[key]),
-                bootstyle="secondary-outline",
-                command=lambda k=key: self._show_tab(k),
-            )
-            btn.pack(side=LEFT, padx=(0, 4))
-            self._tab_btns[key] = btn
+    def _build_settings_panels(self):
+        self._setting_panel_frames["notification"] = self._create_setting_panel(
+            "notification", "card_notification", self._build_panel_notification
+        )
+        self._setting_panel_frames["desktop"] = self._create_setting_panel(
+            "desktop", "card_desktop", self._build_panel_desktop
+        )
+        self._setting_panel_frames["push"] = self._create_setting_panel(
+            "push", "card_push", self._build_panel_push
+        )
+        self._setting_panel_frames["ble"] = self._create_setting_panel(
+            "ble", "card_ble", self._build_panel_ble
+        )
+        self._setting_panel_frames["data"] = self._create_setting_panel(
+            "data", "card_data", self._build_panel_data
+        )
+        self._setting_panel_frames["sound"] = self._create_setting_panel(
+            "sound", "card_sound", self._build_panel_sound
+        )
+        self._setting_panel_frames["about"] = self._create_setting_panel(
+            "about", "card_about", self._build_panel_about
+        )
 
-        # 兼容旧代码里的 self.nb.select(...)
-        class _NbCompat:
-            def __init__(self, app: "App"):
-                self._app = app
+    def _update_sidebar_status(self) -> None:
+        if not hasattr(self, "sidebar"):
+            return
+        self.sidebar.set_run_status(bool(self.running))
+        connected = bool(self.running and (self.cfg.ble_addresses or []))
+        detail = ""
+        if connected and self.cfg.ble_addresses:
+            addr = self.cfg.ble_addresses[0]
+            detail = (self.cfg.device_aliases or {}).get(addr, addr)
+            if len(detail) > 16:
+                detail = detail[:14] + "…"
+        self.sidebar.set_ble_status(connected, detail)
 
-            def select(self, tab_frame):
-                for k, fr in self._app._pages.items():
-                    if fr is tab_frame:
-                        self._app._show_tab(k)
-                        return
-
-        self.nb = _NbCompat(self)
-
-        self._build_main()
-        self._build_devices()
-        self._build_dest()
-        self._build_filter()
-        self._build_misc()
-        self._build_history()
-        self._build_logs()
-        apply_global_theme(self)
-        # 主题应用后再刷一遍页面底，避免 ScrolledFrame/子 Frame 被主题刷灰
-        self._paint_page_bg(self.page_host)
-        for fr in self._pages.values():
-            self._paint_page_bg(fr)
-        self._show_tab("main")
 
     def apply_i18n(self):
         self.title(i18n.t("app_title"))
-        self.ui["lbl_header"].config(
-            text=i18n.t("header_brand"),
-            font=FONT_BRAND,
-            foreground=TEXT_MAIN,
-        )
-        self.ui["lbl_cfg"].config(text=f"{i18n.t('config_path')}: {CONFIG_PATH}")
 
-        if self.running:
-            self.ui["lbl_status"].config(text=i18n.t("status_running"), bootstyle="success")
-        else:
-            self.ui["lbl_status"].config(text=i18n.t("status_stopped"), bootstyle="danger")
+        if hasattr(self, "sidebar"):
+            self.sidebar.apply_i18n()
+            self._update_sidebar_status()
 
-        for key, btn in getattr(self, "_tab_btns", {}).items():
-            btn.configure(text=i18n.t(self._tab_i18n[key]))
+        if "lbl_settings_title" in self.ui:
+            self.ui["lbl_settings_title"].config(text=i18n.t("settings_title"))
+            self.ui["lbl_settings_subtitle"].config(text=i18n.t("settings_subtitle"))
         if "btn_global_save" in self.ui:
             self.ui["btn_global_save"].config(text=i18n.t("save"))
+        for key, _title_key, _desc_key, icon in SETTING_CARDS:
+            card = getattr(self, "_settings_cards", {}).get(key)
+            if card:
+                extra = APP_VERSION if key == "about" else ""
+                card.update_text(
+                    icon,
+                    i18n.t(_title_key),
+                    i18n.t(_desc_key),
+                    extra_right=extra,
+                )
+        for key, title_key, _d, _i in SETTING_CARDS:
+            if f"btn_back_{key}" in self.ui:
+                self.ui[f"btn_back_{key}"].config(text=i18n.t("settings_back"))
+            if f"lbl_panel_{key}" in self.ui:
+                self.ui[f"lbl_panel_{key}"].config(text=i18n.t(title_key))
 
         # main
         self.ui["lbl_run_control"].config(text=i18n.t("run_control"))
         self.ui["btn_start"].config(text=i18n.t("start"))
         self.ui["btn_stop"].config(text=i18n.t("stop"))
-        self.ui["lbl_dedup"].config(text=i18n.t("dedup_sec"))
-        self.ui["chk_code_on"].config(text=i18n.t("enable_code_detect"))
-        self.ui["chk_code_sep"].config(text=i18n.t("send_code_sep"))
-        self.ui["lbl_history_limit"].config(text=i18n.t("history_limit"))
         self.ui["lbl_preview"].config(text=i18n.t("latest_preview"))
         self.ui["lbl_push_preview"].config(text=i18n.t("push_preview"))
-        self.ui["lbl_push_tpl"].config(text=i18n.t("push_template"))
-        self.ui["lbl_tpl_preset"].config(text=i18n.t("tpl_preset"))
-        self.ui["lbl_tpl_var"].config(text=i18n.t("tpl_var"))
-        self.ui["btn_tpl_insert"].config(text=i18n.t("tpl_insert"))
-        self.ui["lbl_tpl_hint"].config(text=i18n.t("tpl_hint"))
-        preset_labels = [i18n.t("tpl_preset_default"), i18n.t("tpl_preset_simple"), i18n.t("tpl_preset_detail")]
-        self.cmb_tpl_preset.config(values=preset_labels)
-        if not self.var_tpl_preset.get():
-            self.cmb_tpl_preset.set(preset_labels[0])
         self.ui["lbl_tip_tray"].config(text=i18n.t("tip_tray"))
+        if "lbl_tpl_page_title" in self.ui:
+            self.ui["lbl_tpl_page_title"].config(text=i18n.t("nav_template"))
+            self.ui["lbl_tpl_preset"].config(text=i18n.t("tpl_preset"))
+            self.ui["lbl_tpl_var"].config(text=i18n.t("tpl_var"))
+            self.ui["btn_tpl_insert"].config(text=i18n.t("tpl_insert"))
+            self.ui["lbl_tpl_hint"].config(text=i18n.t("tpl_hint"))
+            preset_labels = [
+                i18n.t("tpl_preset_default"),
+                i18n.t("tpl_preset_simple"),
+                i18n.t("tpl_preset_detail"),
+            ]
+            self.cmb_tpl_preset.config(values=preset_labels)
+            if not self.var_tpl_preset.get():
+                self.cmb_tpl_preset.set(preset_labels[0])
+        if "lbl_push_dedup" in self.ui:
+            self.ui["lbl_push_dedup"].config(text=i18n.t("dedup_sec"))
+            self.ui["chk_code_on"].config(text=i18n.t("enable_code_detect"))
+            self.ui["chk_code_sep"].config(text=i18n.t("send_code_sep"))
+        if "lbl_data_history" in self.ui:
+            self.ui["lbl_data_history"].config(text=i18n.t("history_limit"))
+            self.ui["lbl_data_clear_hint"].config(text=i18n.t("data_clear_hint"))
+        if "lbl_about_version" in self.ui:
+            self.ui["lbl_about_version"].config(
+                text=f"{i18n.t('about_version')}: {APP_VERSION}"
+            )
+            self.ui["lbl_about_author"].config(text=i18n.t("about_author"))
 
         # devices
-        self.ui["lbl_devices_title"].config(text=i18n.t("selected_ble"))
-        self.ui["btn_scan"].config(text=i18n.t("scan"))
-        self.ui["btn_add_addr"].config(text=i18n.t("add"))
-        self.ui["btn_remove_addr"].config(text=i18n.t("remove_selected"))
-        self.ui["txt_scan_hint"].config(text=i18n.t("scan_hint"))
-        self.ui["lbl_device_alias"].config(text=i18n.t("device_alias"))
-        self.ui["btn_set_device_alias"].config(text=i18n.t("set_alias"))
-        if "dev_tree" in self.ui:
-            self.ui["dev_tree"].heading("addr", text=i18n.t("col_ble_addr"))
-            self.ui["dev_tree"].heading("alias", text=i18n.t("col_alias"))
+        if "lbl_devices_title" in self.ui:
+            self.ui["lbl_devices_title"].config(text=i18n.t("selected_ble"))
+            self.ui["btn_scan"].config(text=i18n.t("scan"))
+            self.ui["btn_add_addr"].config(text=i18n.t("add"))
+            self.ui["btn_remove_addr"].config(text=i18n.t("remove_selected"))
+            self.ui["txt_scan_hint"].config(text=i18n.t("scan_hint"))
+            self.ui["lbl_device_alias"].config(text=i18n.t("device_alias"))
+            self.ui["btn_set_device_alias"].config(text=i18n.t("set_alias"))
+            if "dev_tree" in self.ui:
+                self.ui["dev_tree"].heading("addr", text=i18n.t("col_ble_addr"))
+                self.ui["dev_tree"].heading("alias", text=i18n.t("col_alias"))
 
         # history / app map
-        self.ui["lbl_app_map"].config(text=i18n.t("app_map_title"))
-        self.ui["lbl_map_hint"].config(text=i18n.t("app_map_hint"))
-        self.ui["lbl_map_bundle"].config(text=i18n.t("col_bundle_id"))
-        self.ui["lbl_map_name"].config(text=i18n.t("col_app_name"))
-        self.ui["btn_map_upsert"].config(text=i18n.t("map_upsert"))
-        self.ui["btn_map_remove"].config(text=i18n.t("remove_selected"))
+        if "lbl_app_map" in self.ui:
+            self.ui["lbl_app_map"].config(text=i18n.t("app_map_title"))
+            self.ui["lbl_map_hint"].config(text=i18n.t("app_map_hint"))
+            self.ui["lbl_map_bundle"].config(text=i18n.t("col_bundle_id"))
+            self.ui["lbl_map_name"].config(text=i18n.t("col_app_name"))
+            self.ui["btn_map_upsert"].config(text=i18n.t("map_upsert"))
+            self.ui["btn_map_remove"].config(text=i18n.t("remove_selected"))
         if "map_tree" in self.ui:
             self.ui["map_tree"].heading("bundle", text=i18n.t("col_bundle_id"))
             self.ui["map_tree"].heading("name", text=i18n.t("col_app_name"))
@@ -516,23 +627,27 @@ class App(tb.Window):
             self.ui["tree"].heading("app", text=i18n.t("col_app_name"))
 
         # filter
-        self.ui["lbl_block_intro"].config(text=i18n.t("block_intro"))
-        self.ui["chk_block_ci"].config(text=i18n.t("case_insensitive"))
-        self.ui["btn_add_block"].config(text=i18n.t("add"))
-        self.ui["btn_remove_block"].config(text=i18n.t("remove_selected"))
+        if "lbl_block_intro" in self.ui:
+            self.ui["lbl_block_intro"].config(text=i18n.t("block_intro"))
+            self.ui["chk_block_ci"].config(text=i18n.t("case_insensitive"))
+            self.ui["btn_add_block"].config(text=i18n.t("add"))
+            self.ui["btn_remove_block"].config(text=i18n.t("remove_selected"))
 
-        # misc
-        self.ui["lbl_misc_title"].config(text=i18n.t("misc_title"))
-        self.ui["chk_battery"].config(text=i18n.t("misc_battery"))
-        self.ui["chk_toast"].config(text=i18n.t("misc_toast"))
-        self.ui["lbl_toast_hint"].config(text=i18n.t("misc_toast_hint"))
-        self.ui["btn_test_toast"].config(text=i18n.t("misc_toast_test"))
-        self.ui["lbl_popup_position"].config(text=i18n.t("misc_popup_position"))
+        # settings panels
+        if "chk_battery" in self.ui:
+            self.ui["chk_battery"].config(text=i18n.t("misc_battery"))
+        if "chk_toast" in self.ui:
+            self.ui["chk_toast"].config(text=i18n.t("misc_toast"))
+            self.ui["lbl_toast_hint"].config(text=i18n.t("misc_toast_hint"))
+            self.ui["btn_test_toast"].config(text=i18n.t("misc_toast_test"))
+        if "lbl_popup_position" in self.ui:
+            self.ui["lbl_popup_position"].config(text=i18n.t("misc_popup_position"))
         if hasattr(self, "cmb_popup_pos"):
             cur = self._popup_pos_key_from_label(self.var_popup_pos.get())
             self.cmb_popup_pos.configure(values=[self._popup_pos_label_from_key(k) for k in self._popup_pos_keys])
             self.var_popup_pos.set(self._popup_pos_label_from_key(cur))
-        self.ui["lbl_notif_font"].config(text=i18n.t("misc_notif_font"))
+        if "lbl_notif_font" in self.ui:
+            self.ui["lbl_notif_font"].config(text=i18n.t("misc_notif_font"))
         if hasattr(self, "cmb_notif_font"):
             cur_font = self._notif_font_key_from_label(self.var_notif_font.get())
             font_values = list(dict.fromkeys(
@@ -544,7 +659,8 @@ class App(tb.Window):
             self.var_notif_font.set(label)
         if "lbl_notif_font_restart" in self.ui:
             self.ui["lbl_notif_font_restart"].config(text=i18n.t("misc_restart_hint"))
-        self.ui["lbl_notif_width"].config(text=i18n.t("misc_notif_width"))
+        if "lbl_notif_width" in self.ui:
+            self.ui["lbl_notif_width"].config(text=i18n.t("misc_notif_width"))
         if hasattr(self, "cmb_notif_width"):
             cur_width = self._notif_width_key_from_label(self.var_notif_width.get())
             width_values = list(dict.fromkeys(
@@ -618,31 +734,36 @@ class App(tb.Window):
         self.ui["btn_stop"] = tb.Button(btns, text="", bootstyle="danger", command=self.on_stop)
         self.ui["btn_stop"].pack(side=LEFT)
 
-        tb.Separator(left).pack(fill=X, pady=10)
+        self.ui["lbl_tip_tray"] = tb.Label(left, text="", bootstyle="secondary", wraplength=280, justify=LEFT)
+        self.ui["lbl_tip_tray"].pack(anchor=W, pady=(16, 0))
 
-        self.var_dedup = tk.StringVar(value=str(getattr(self.cfg, "dedup_seconds", 8)))
-        self.ui["lbl_dedup"] = tb.Label(left, text="")
-        self.ui["lbl_dedup"].pack(anchor=W)
-        tb.Entry(left, textvariable=self.var_dedup, width=10).pack(anchor=W, pady=(0, 10))
+        right = tb.Frame(frm)
+        right.pack(side=LEFT, fill=BOTH, expand=True)
 
-        self.var_code_on = tk.BooleanVar(value=self.cfg.enable_code_highlight)
-        self.var_code_sep = tk.BooleanVar(value=self.cfg.code_send_separately)
-        self.ui["chk_code_on"] = tb.Checkbutton(left, text="", variable=self.var_code_on, bootstyle="round-toggle")
-        self.ui["chk_code_on"].pack(anchor=W, pady=(0, 6))
-        self.ui["chk_code_sep"] = tb.Checkbutton(left, text="", variable=self.var_code_sep, bootstyle="round-toggle")
-        self.ui["chk_code_sep"].pack(anchor=W)
+        self.ui["lbl_preview"] = tb.Label(right, text="", font=("Segoe UI", 12, "bold"))
+        self.ui["lbl_preview"].pack(anchor=W)
 
-        self.var_history_limit = tk.StringVar(value=str(self.cfg.history_limit))
-        self.ui["lbl_history_limit"] = tb.Label(left, text="")
-        self.ui["lbl_history_limit"].pack(anchor=W, pady=(10, 0))
-        tb.Entry(left, textvariable=self.var_history_limit, width=10).pack(anchor=W)
+        self.preview = tk.Text(right, height=10, wrap="word")
+        self.preview.pack(fill=X, pady=(8, 8))
+        self.preview.insert("end", "（暂无）\n")
+        self.preview.bind("<Double-1>", lambda _e: self._show_last_notification_detail())
 
-        tb.Separator(left).pack(fill=X, pady=10)
+        self.ui["lbl_push_preview"] = tb.Label(right, text="推送预览", font=("Segoe UI", 12, "bold"))
+        self.ui["lbl_push_preview"].pack(anchor=W)
 
-        self.ui["lbl_push_tpl"] = tb.Label(left, text="推送模板", font=("Segoe UI", 11, "bold"))
-        self.ui["lbl_push_tpl"].pack(anchor=W, pady=(0, 6))
+        self.push_preview = tk.Text(right, height=10, wrap="word")
+        self.push_preview.pack(fill=X, pady=(8, 8))
+        self.push_preview.insert("end", "（暂无）\n")
+        self._last_payload: Optional[dict] = None
 
-        preset_row = tb.Frame(left)
+    def _build_template(self):
+        frm = tb.Frame(self.tab_template, padding=(PAGE_PADX, PAGE_PADY))
+        frm.pack(fill=BOTH, expand=True)
+
+        self.ui["lbl_tpl_page_title"] = tb.Label(frm, text="", font=("Segoe UI", 14, "bold"))
+        self.ui["lbl_tpl_page_title"].pack(anchor=W, pady=(0, 10))
+
+        preset_row = tb.Frame(frm)
         preset_row.pack(fill=X, pady=(0, 6))
         self.ui["lbl_tpl_preset"] = tb.Label(preset_row, text="预设")
         self.ui["lbl_tpl_preset"].pack(side=LEFT, padx=(0, 8))
@@ -653,15 +774,15 @@ class App(tb.Window):
             state="readonly",
             width=18,
         )
-        self.cmb_tpl_preset.pack(side=LEFT, fill=X, expand=True)
+        self.cmb_tpl_preset.pack(side=LEFT)
         self.cmb_tpl_preset.bind("<<ComboboxSelected>>", self._on_tpl_preset_change)
 
-        self.txt_push_template = tk.Text(left, height=7, wrap="word", width=42)
-        self.txt_push_template.pack(fill=X, pady=(0, 6))
+        self.txt_push_template = tk.Text(frm, height=12, wrap="word")
+        self.txt_push_template.pack(fill=BOTH, expand=True, pady=(0, 6))
         tpl_text = getattr(self.cfg, "push_template", "") or PUSH_TEMPLATE_PRESETS["default"]
         self.txt_push_template.insert("1.0", tpl_text)
 
-        var_row = tb.Frame(left)
+        var_row = tb.Frame(frm)
         var_row.pack(fill=X, pady=(0, 6))
         self.ui["lbl_tpl_var"] = tb.Label(var_row, text="插入变量")
         self.ui["lbl_tpl_var"].pack(side=LEFT, padx=(0, 8))
@@ -675,33 +796,15 @@ class App(tb.Window):
         self.ui["btn_tpl_insert"].pack(side=LEFT)
 
         hint = "  ".join(f"{{{k}}}" for k, _ in PUSH_TEMPLATE_VARS)
-        self.ui["lbl_tpl_hint"] = tb.Label(left, text=hint, bootstyle="secondary", wraplength=380, justify=LEFT)
+        self.ui["lbl_tpl_hint"] = tb.Label(frm, text=hint, bootstyle="secondary", wraplength=640, justify=LEFT)
         self.ui["lbl_tpl_hint"].pack(anchor=W)
 
-        right = tb.Frame(frm)
-        right.pack(side=LEFT, fill=BOTH, expand=True)
-
-        self.ui["lbl_preview"] = tb.Label(right, text="", font=("Segoe UI", 12, "bold"))
-        self.ui["lbl_preview"].pack(anchor=W)
-
-        self.preview = tk.Text(right, height=8, wrap="word")
-        self.preview.pack(fill=X, pady=(8, 8))
-        self.preview.insert("end", "（暂无）\n")
-        self.preview.bind("<Double-1>", lambda _e: self._show_last_notification_detail())
-
-        self.ui["lbl_push_preview"] = tb.Label(right, text="推送预览", font=("Segoe UI", 12, "bold"))
-        self.ui["lbl_push_preview"].pack(anchor=W)
-
-        self.push_preview = tk.Text(right, height=8, wrap="word")
-        self.push_preview.pack(fill=X, pady=(8, 8))
-        self.push_preview.insert("end", "（暂无）\n")
-
-        self.ui["lbl_tip_tray"] = tb.Label(right, text="")
-        self.ui["lbl_tip_tray"].pack(anchor=W)
-        self._last_payload: Optional[dict] = None
-
-    def _build_devices(self):
-        frm = self._make_hidden_scrolled(self.tab_devices)
+    def _build_devices(self, parent=None):
+        host = parent if parent is not None else self.tab_devices
+        if parent is None:
+            frm = self._make_hidden_scrolled(host)
+        else:
+            frm = parent
 
         top = tb.Frame(frm)
         top.pack(fill=X, pady=(0, 10))
@@ -969,8 +1072,12 @@ class App(tb.Window):
         )
         self._enable_hidden_scroll(frm)
 
-    def _build_filter(self):
-        frm = self._make_hidden_scrolled(self.tab_filter)
+    def _build_filter(self, parent=None):
+        host = parent if parent is not None else self.tab_filter
+        if parent is None:
+            frm = self._make_hidden_scrolled(host)
+        else:
+            frm = parent
 
         self.ui["lbl_block_intro"] = tb.Label(frm, text="", font=("Segoe UI", 12, "bold"))
         self.ui["lbl_block_intro"].pack(anchor=W, pady=(0, 8))
@@ -995,26 +1102,46 @@ class App(tb.Window):
         self.ui["btn_remove_block"].pack(side=LEFT)
         self._enable_hidden_scroll(frm)
 
-    def _build_misc(self):
-        frm = self._make_hidden_scrolled(self.tab_misc)
-
-        self.ui["lbl_misc_title"] = tb.Label(frm, text="", font=("Segoe UI", 12, "bold"))
-        self.ui["lbl_misc_title"].pack(anchor=W, pady=(0, 4))
-
+    def _build_panel_notification(self, frm):
+        """通知设置：电量、验证码、屏蔽关键词。"""
         self.var_show_battery = tk.BooleanVar(value=getattr(self.cfg, "show_battery_in_message", True))
-        self.var_win_toast = tk.BooleanVar(value=getattr(self.cfg, "enable_windows_toast", True))
+        self.ui["chk_battery"] = tb.Checkbutton(
+            frm, text="", variable=self.var_show_battery, bootstyle="round-toggle"
+        )
+        self.ui["chk_battery"].pack(anchor=W, pady=(0, 8))
 
-        self.ui["chk_battery"] = tb.Checkbutton(frm, text="", variable=self.var_show_battery, bootstyle="round-toggle")
-        self.ui["chk_battery"].pack(anchor=W, pady=(0, 3))
+        self.var_code_on = tk.BooleanVar(value=self.cfg.enable_code_highlight)
+        self.var_code_sep = tk.BooleanVar(value=self.cfg.code_send_separately)
+        self.ui["chk_code_on"] = tb.Checkbutton(
+            frm, text="", variable=self.var_code_on, bootstyle="round-toggle"
+        )
+        self.ui["chk_code_on"].pack(anchor=W, pady=(0, 6))
+        self.ui["chk_code_sep"] = tb.Checkbutton(
+            frm, text="", variable=self.var_code_sep, bootstyle="round-toggle"
+        )
+        self.ui["chk_code_sep"].pack(anchor=W, pady=(0, 12))
+
+        tb.Separator(frm).pack(fill=X, pady=(4, 10))
+        self._build_filter(parent=frm)
+
+    def _build_panel_desktop(self, frm):
+        """桌面通知：全部弹窗相关旧杂项控件。"""
+        self.var_win_toast = tk.BooleanVar(value=getattr(self.cfg, "enable_windows_toast", True))
 
         toast_row = tb.Frame(frm)
         toast_row.pack(fill=X, anchor=W, pady=(0, 2))
-        self.ui["chk_toast"] = tb.Checkbutton(toast_row, text="", variable=self.var_win_toast, bootstyle="round-toggle")
+        self.ui["chk_toast"] = tb.Checkbutton(
+            toast_row, text="", variable=self.var_win_toast, bootstyle="round-toggle"
+        )
         self.ui["chk_toast"].pack(side=LEFT)
-        self.ui["btn_test_toast"] = tb.Button(toast_row, text="测试弹窗", bootstyle="info", command=self.test_desktop_toast)
+        self.ui["btn_test_toast"] = tb.Button(
+            toast_row, text="测试弹窗", bootstyle="info", command=self.test_desktop_toast
+        )
         self.ui["btn_test_toast"].pack(side=LEFT, padx=(12, 0))
 
-        self.ui["lbl_toast_hint"] = tb.Label(frm, text="", bootstyle="secondary", wraplength=520, justify=LEFT)
+        self.ui["lbl_toast_hint"] = tb.Label(
+            frm, text="", bootstyle="secondary", wraplength=520, justify=LEFT
+        )
         self.ui["lbl_toast_hint"].pack(anchor=W, pady=(0, 4))
 
         pos_row = tb.Frame(frm)
@@ -1039,7 +1166,6 @@ class App(tb.Window):
         self._notif_font_keys = [6, 8, 10, 12]
         self.ui["lbl_notif_font"] = tb.Label(font_row, text="通知字体大小")
         self.ui["lbl_notif_font"].pack(side=LEFT, padx=(0, 8))
-        # 先读 config 数值，再创建 Combobox，并 set 选中文本
         _font_size_cfg = normalize_notification_font_size(
             getattr(self.cfg, "notification_font_size", 10)
         )
@@ -1062,10 +1188,6 @@ class App(tb.Window):
             font_row, text="修改后需要重启程序生效", bootstyle="secondary"
         )
         self.ui["lbl_notif_font_restart"].pack(side=LEFT, padx=(8, 0))
-        print(
-            f"[UI] notification_font_size={_font_size_cfg}, "
-            f"combobox={self.cmb_notif_font.get()!r}"
-        )
 
         width_row = tb.Frame(frm)
         width_row.pack(fill=X, anchor=W, pady=(0, 3))
@@ -1075,8 +1197,9 @@ class App(tb.Window):
         self.var_notif_width = tk.StringVar(
             value=self._notif_width_label_from_key(getattr(self.cfg, "notification_width", 420))
         )
-        width_values = [self._notif_width_label_from_key(k) for k in self._notif_width_keys]
-        width_values = list(dict.fromkeys(width_values))
+        width_values = list(
+            dict.fromkeys([self._notif_width_label_from_key(k) for k in self._notif_width_keys])
+        )
         self.cmb_notif_width = tb.Combobox(
             width_row,
             textvariable=self.var_notif_width,
@@ -1177,11 +1300,212 @@ class App(tb.Window):
         )
         self.ui["lbl_auto_close_hint"].pack(anchor=W, pady=(0, 3))
 
+        self.privacy_frm = tb.Labelframe(frm, text="隐私设置", padding=6)
+        self.privacy_frm.pack(fill=X, anchor=W, pady=(4, 4))
+
+        def _normalize_preview_entry():
+            val = normalize_max_preview_chars(self.var_max_preview.get())
+            self.var_max_preview.set(str(val))
+            return val
+
+        def _sync_popup_ui_settings(_evt=None):
+            preview_chars = _normalize_preview_entry()
+            max_pop = normalize_max_pop_notification(self.var_max_pop.get())
+            self.var_max_pop.set(max_pop)
+            self.ui["lbl_max_pop_val"].config(text=str(max_pop))
+            self.popup_toast.apply_ui_settings(
+                popup_position=self._popup_pos_key_from_label(self.var_popup_pos.get()),
+                notification_font_size=self._notif_font_key_from_label(self.var_notif_font.get()),
+                notification_width=self._notif_width_key_from_label(self.var_notif_width.get()),
+                privacy_show_title=bool(self.var_privacy_show_title.get()),
+                privacy_show_msg=bool(self.var_privacy_show_msg.get()),
+                max_preview_chars=preview_chars,
+                max_pop_notification=max_pop,
+            )
+            if self.running and self.manager:
+                self.manager.cfg.popup_position = self._popup_pos_key_from_label(self.var_popup_pos.get())
+                self.manager.cfg.notification_font_size = self._notif_font_key_from_label(
+                    self.var_notif_font.get()
+                )
+                self.manager.cfg.notification_width = self._notif_width_key_from_label(
+                    self.var_notif_width.get()
+                )
+                self.manager.cfg.privacy_show_title = bool(self.var_privacy_show_title.get())
+                self.manager.cfg.privacy_show_msg = bool(self.var_privacy_show_msg.get())
+                self.manager.cfg.max_preview_chars = preview_chars
+                self.manager.cfg.max_pop_notification = max_pop
+
+        self.var_privacy_show_title = tk.BooleanVar(value=getattr(self.cfg, "privacy_show_title", True))
+        self.ui["chk_privacy_show_title"] = tb.Checkbutton(
+            self.privacy_frm,
+            text="显示通知标题（发件人/会话标题）",
+            variable=self.var_privacy_show_title,
+            bootstyle="round-toggle",
+            command=_sync_popup_ui_settings,
+        )
+        self.ui["chk_privacy_show_title"].pack(anchor=W, pady=(0, 1))
+        self.ui["lbl_privacy_show_title_hint"] = tb.Label(
+            self.privacy_frm, text="", bootstyle="secondary", wraplength=520, justify=LEFT
+        )
+        self.ui["lbl_privacy_show_title_hint"].pack(anchor=W, pady=(0, 3))
+
+        self.var_privacy_show_msg = tk.BooleanVar(value=getattr(self.cfg, "privacy_show_msg", True))
+        self.ui["chk_privacy_show_msg"] = tb.Checkbutton(
+            self.privacy_frm,
+            text="显示通知消息内容（消息正文）",
+            variable=self.var_privacy_show_msg,
+            bootstyle="round-toggle",
+            command=_sync_popup_ui_settings,
+        )
+        self.ui["chk_privacy_show_msg"].pack(anchor=W, pady=(0, 1))
+        self.ui["lbl_privacy_show_msg_hint"] = tb.Label(
+            self.privacy_frm, text="", bootstyle="secondary", wraplength=520, justify=LEFT
+        )
+        self.ui["lbl_privacy_show_msg_hint"].pack(anchor=W)
+
+        self.cmb_popup_pos.bind("<<ComboboxSelected>>", _sync_popup_ui_settings)
+        self.cmb_notif_font.bind("<<ComboboxSelected>>", _sync_popup_ui_settings)
+        self.cmb_notif_width.bind("<<ComboboxSelected>>", _sync_popup_ui_settings)
+        self.ent_max_preview.bind("<FocusOut>", _sync_popup_ui_settings)
+        self.ent_max_preview.bind("<Return>", _sync_popup_ui_settings)
+
+        def _on_toast_toggle():
+            if self.running and self.manager:
+                self.manager.cfg.enable_windows_toast = bool(self.var_win_toast.get())
+
+        self.var_win_toast.trace_add("write", lambda *_: _on_toast_toggle())
+
+    def _build_panel_push(self, frm):
+        """推送行为：去重等全局参数；详细目标在推送目标页。"""
+        self.var_dedup = tk.StringVar(value=str(getattr(self.cfg, "dedup_seconds", 8)))
+        self.ui["lbl_push_dedup"] = tb.Label(frm, text="")
+        self.ui["lbl_push_dedup"].pack(anchor=W)
+        tb.Entry(frm, textvariable=self.var_dedup, width=10).pack(anchor=W, pady=(0, 10))
+
+        tip = tb.Label(
+            frm,
+            text="转发目标（Telegram / 钉钉 / Gotify / 邮件等）请到左侧「推送目标」配置；消息模板请到「推送模板」。",
+            bootstyle="secondary",
+            wraplength=520,
+            justify=LEFT,
+        )
+        tip.pack(anchor=W, pady=(4, 0))
+        self.ui["lbl_push_behavior_tip"] = tip
+
+    def _build_panel_ble(self, frm):
+        """iPhone / BLE：设备扫描与地址。"""
+        self._build_devices(parent=frm)
+
+    def _build_panel_data(self, frm):
+        """数据与历史。"""
+        self.var_history_limit = tk.StringVar(value=str(self.cfg.history_limit))
+        self.ui["lbl_data_history"] = tb.Label(frm, text="")
+        self.ui["lbl_data_history"].pack(anchor=W)
+        tb.Entry(frm, textvariable=self.var_history_limit, width=10).pack(anchor=W, pady=(0, 10))
+
+        backup_frm = tb.Frame(frm)
+        backup_frm.pack(fill=X, anchor=W, pady=(2, 3))
+        self.var_auto_backup = tk.BooleanVar(value=bool(getattr(self.cfg, "auto_backup_enable", False)))
+        self.ui["chk_auto_backup"] = tb.Checkbutton(
+            backup_frm,
+            text="开启自动备份通知",
+            variable=self.var_auto_backup,
+            bootstyle="round-toggle",
+        )
+        self.ui["chk_auto_backup"].pack(anchor=W)
+        self.ui["lbl_auto_backup_hint"] = tb.Label(
+            backup_frm, text="", bootstyle="secondary", wraplength=520, justify=LEFT
+        )
+        self.ui["lbl_auto_backup_hint"].pack(anchor=W, pady=(0, 2))
+        path_row = tb.Frame(backup_frm)
+        path_row.pack(fill=X, anchor=W)
+        self.ui["lbl_auto_backup_path"] = tb.Label(path_row, text="备份文件路径（留空用默认）")
+        self.ui["lbl_auto_backup_path"].pack(side=LEFT, padx=(0, 8))
+        self.var_auto_backup_path = tk.StringVar(value=str(getattr(self.cfg, "auto_backup_path", "") or ""))
+        self.ent_auto_backup_path = tb.Entry(path_row, textvariable=self.var_auto_backup_path)
+        self.ent_auto_backup_path.pack(side=LEFT, fill=X, expand=True)
+
+        # 开机自启动
+        autostart_frm = tb.Frame(frm)
+        autostart_frm.pack(fill=X, anchor=W, pady=(6, 3))
+        _auto_on = bool(
+            getattr(self.cfg, "auto_start", False)
+            or getattr(self.cfg, "autostart_enabled", False)
+        )
+        self.var_auto_start = tk.BooleanVar(value=_auto_on)
+        self.ui["chk_auto_start"] = tb.Checkbutton(
+            autostart_frm,
+            text="开机自动启动 NekoLink",
+            variable=self.var_auto_start,
+            bootstyle="round-toggle",
+        )
+        self.ui["chk_auto_start"].pack(anchor=W)
+        self.ui["lbl_auto_start_hint"] = tb.Label(
+            autostart_frm,
+            text="开启后程序随系统开机自动运行",
+            bootstyle="secondary",
+            wraplength=520,
+            justify=LEFT,
+        )
+        self.ui["lbl_auto_start_hint"].pack(anchor=W, pady=(0, 2))
+
+        # 托盘图标
+        tray_frm = tb.Frame(frm)
+        tray_frm.pack(fill=X, anchor=W, pady=(4, 3))
+        tray_row = tb.Frame(tray_frm)
+        tray_row.pack(fill=X, anchor=W)
+        self.ui["lbl_tray_icon"] = tb.Label(tray_row, text="状态栏图标")
+        self.ui["lbl_tray_icon"].pack(side=LEFT, padx=(0, 8))
+        self.var_tray_icon_path = tk.StringVar(
+            value=str(getattr(self.cfg, "tray_icon_path", DEFAULT_TRAY_ICON_REL) or DEFAULT_TRAY_ICON_REL)
+        )
+        self.ent_tray_icon_path = tb.Entry(tray_row, textvariable=self.var_tray_icon_path)
+        self.ent_tray_icon_path.pack(side=LEFT, fill=X, expand=True, padx=(0, 8))
+
+        def _browse_tray_icon():
+            path = filedialog.askopenfilename(
+                title=i18n.t("misc_tray_icon"),
+                filetypes=[
+                    ("Icons / Images", "*.ico;*.png;*.jpg;*.jpeg;*.bmp;*.webp"),
+                    ("ICO", "*.ico"),
+                    ("PNG", "*.png"),
+                    ("All", "*.*"),
+                ],
+            )
+            if path:
+                self.var_tray_icon_path.set(path)
+
+        self.ui["btn_tray_icon_browse"] = tb.Button(
+            tray_row, text=i18n.t("browse"), bootstyle="secondary-outline", command=_browse_tray_icon
+        )
+        self.ui["btn_tray_icon_browse"].pack(side=LEFT)
+        self.ui["lbl_tray_icon_hint"] = tb.Label(
+            tray_frm,
+            text="修改状态栏图标后需要重启程序生效",
+            bootstyle="secondary",
+            wraplength=520,
+            justify=LEFT,
+        )
+        self.ui["lbl_tray_icon_hint"].pack(anchor=W, pady=(2, 0))
+
+        self.ui["lbl_data_clear_hint"] = tb.Label(
+            frm, text="", bootstyle="secondary", wraplength=520, justify=LEFT
+        )
+        self.ui["lbl_data_clear_hint"].pack(anchor=W, pady=(10, 0))
+
+        def _sync_backup(_evt=None):
+            if self.running and self.manager:
+                self.manager.cfg.auto_backup_enable = bool(self.var_auto_backup.get())
+                self.manager.cfg.auto_backup_path = self.var_auto_backup_path.get().strip()
+
+        self.var_auto_backup.trace_add("write", lambda *_: _sync_backup())
+        self.ent_auto_backup_path.bind("<FocusOut>", _sync_backup)
+
+    def _build_panel_sound(self, frm):
+        """声音与提醒。"""
         sound_frm = tb.Frame(frm)
         sound_frm.pack(fill=X, anchor=W, pady=(2, 3))
-        self.var_sound_enable = tk.BooleanVar(
-            value=bool(getattr(self.cfg, "sound_enable", True))
-        )
+        self.var_sound_enable = tk.BooleanVar(value=bool(getattr(self.cfg, "sound_enable", True)))
         self.ui["chk_sound_enable"] = tb.Checkbutton(
             sound_frm,
             text="启用通知提示音",
@@ -1191,7 +1515,6 @@ class App(tb.Window):
         )
         self.ui["chk_sound_enable"].pack(anchor=W)
 
-        # 音效文件下拉：启动扫描 assets/sound/*.wav
         file_row = tb.Frame(sound_frm)
         file_row.pack(fill=X, anchor=W, pady=(2, 0))
         self.ui["lbl_sound_file"] = tb.Label(file_row, text="提示音音效文件:")
@@ -1242,7 +1565,6 @@ class App(tb.Window):
         )
         self.scl_sound_volume.set(self.var_sound_volume.get())
         self.scl_sound_volume.pack(side=LEFT, fill=X, expand=True)
-        # 启动时同步内存运行时，避免未点保存前读到默认值
         self._app_sound_map = normalize_app_sound_map(
             getattr(self.cfg, "app_sound_map", {}) or {}
         )
@@ -1256,7 +1578,7 @@ class App(tb.Window):
         )
         self.ui["lbl_sound_hint"] = tb.Label(
             sound_frm,
-            text="提示：将 .wav 放入 assets/sound/ 后重启可出现在下拉框；按 App 专属音效请到「历史→应用名称映射」设置",
+            text="提示：将 .wav 放入 assets/sound/ 后重启可出现在下拉框；按 App 专属音效请到「消息历史→应用名称映射」设置",
             bootstyle="secondary",
             wraplength=520,
             justify=LEFT,
@@ -1277,170 +1599,15 @@ class App(tb.Window):
             except Exception:
                 pass
 
-        backup_frm = tb.Frame(frm)
-        backup_frm.pack(fill=X, anchor=W, pady=(2, 3))
-        self.var_auto_backup = tk.BooleanVar(value=bool(getattr(self.cfg, "auto_backup_enable", False)))
-        self.ui["chk_auto_backup"] = tb.Checkbutton(
-            backup_frm,
-            text="开启自动备份通知",
-            variable=self.var_auto_backup,
-            bootstyle="round-toggle",
+    def _build_panel_about(self, frm):
+        self.ui["lbl_about_version"] = tb.Label(
+            frm, text=f"{i18n.t('about_version')}: {APP_VERSION}", font=("Segoe UI", 12, "bold")
         )
-        self.ui["chk_auto_backup"].pack(anchor=W)
-        self.ui["lbl_auto_backup_hint"] = tb.Label(
-            backup_frm, text="", bootstyle="secondary", wraplength=520, justify=LEFT
+        self.ui["lbl_about_version"].pack(anchor=W, pady=(8, 4))
+        self.ui["lbl_about_author"] = tb.Label(
+            frm, text=i18n.t("about_author"), bootstyle="secondary", wraplength=520, justify=LEFT
         )
-        self.ui["lbl_auto_backup_hint"].pack(anchor=W, pady=(0, 2))
-        path_row = tb.Frame(backup_frm)
-        path_row.pack(fill=X, anchor=W)
-        self.ui["lbl_auto_backup_path"] = tb.Label(path_row, text="备份文件路径（留空用默认）")
-        self.ui["lbl_auto_backup_path"].pack(side=LEFT, padx=(0, 8))
-        self.var_auto_backup_path = tk.StringVar(value=str(getattr(self.cfg, "auto_backup_path", "") or ""))
-        self.ent_auto_backup_path = tb.Entry(path_row, textvariable=self.var_auto_backup_path)
-        self.ent_auto_backup_path.pack(side=LEFT, fill=X, expand=True)
-
-        # 开机自启动（默认关闭；保存时写入/删除计划任务）
-        autostart_frm = tb.Frame(frm)
-        autostart_frm.pack(fill=X, anchor=W, pady=(6, 3))
-        _auto_on = bool(
-            getattr(self.cfg, "auto_start", False)
-            or getattr(self.cfg, "autostart_enabled", False)
-        )
-        self.var_auto_start = tk.BooleanVar(value=_auto_on)
-        self.ui["chk_auto_start"] = tb.Checkbutton(
-            autostart_frm,
-            text="开机自动启动 NekoLink",
-            variable=self.var_auto_start,
-            bootstyle="round-toggle",
-        )
-        self.ui["chk_auto_start"].pack(anchor=W)
-        self.ui["lbl_auto_start_hint"] = tb.Label(
-            autostart_frm,
-            text="开启后程序随系统开机自动运行",
-            bootstyle="secondary",
-            wraplength=520,
-            justify=LEFT,
-        )
-        self.ui["lbl_auto_start_hint"].pack(anchor=W, pady=(0, 2))
-
-        # 状态栏 / 托盘图标路径
-        tray_frm = tb.Frame(frm)
-        tray_frm.pack(fill=X, anchor=W, pady=(4, 3))
-        tray_row = tb.Frame(tray_frm)
-        tray_row.pack(fill=X, anchor=W)
-        self.ui["lbl_tray_icon"] = tb.Label(tray_row, text="状态栏图标")
-        self.ui["lbl_tray_icon"].pack(side=LEFT, padx=(0, 8))
-        self.var_tray_icon_path = tk.StringVar(
-            value=str(getattr(self.cfg, "tray_icon_path", DEFAULT_TRAY_ICON_REL) or DEFAULT_TRAY_ICON_REL)
-        )
-        self.ent_tray_icon_path = tb.Entry(tray_row, textvariable=self.var_tray_icon_path)
-        self.ent_tray_icon_path.pack(side=LEFT, fill=X, expand=True, padx=(0, 8))
-
-        def _browse_tray_icon():
-            path = filedialog.askopenfilename(
-                title=i18n.t("misc_tray_icon"),
-                filetypes=[
-                    ("Icons / Images", "*.ico;*.png;*.jpg;*.jpeg;*.bmp;*.webp"),
-                    ("ICO", "*.ico"),
-                    ("PNG", "*.png"),
-                    ("All", "*.*"),
-                ],
-            )
-            if path:
-                self.var_tray_icon_path.set(path)
-
-        self.ui["btn_tray_icon_browse"] = tb.Button(
-            tray_row, text=i18n.t("browse"), bootstyle="secondary-outline", command=_browse_tray_icon
-        )
-        self.ui["btn_tray_icon_browse"].pack(side=LEFT)
-        self.ui["lbl_tray_icon_hint"] = tb.Label(
-            tray_frm,
-            text="修改状态栏图标后需要重启程序生效",
-            bootstyle="secondary",
-            wraplength=520,
-            justify=LEFT,
-        )
-        self.ui["lbl_tray_icon_hint"].pack(anchor=W, pady=(2, 0))
-
-        def _normalize_preview_entry():
-            val = normalize_max_preview_chars(self.var_max_preview.get())
-            self.var_max_preview.set(str(val))
-            return val
-
-        def _sync_popup_ui_settings(_evt=None):
-            preview_chars = _normalize_preview_entry()
-            max_pop = normalize_max_pop_notification(self.var_max_pop.get())
-            self.var_max_pop.set(max_pop)
-            self.ui["lbl_max_pop_val"].config(text=str(max_pop))
-            self.popup_toast.apply_ui_settings(
-                popup_position=self._popup_pos_key_from_label(self.var_popup_pos.get()),
-                notification_font_size=self._notif_font_key_from_label(self.var_notif_font.get()),
-                notification_width=self._notif_width_key_from_label(self.var_notif_width.get()),
-                privacy_show_title=bool(self.var_privacy_show_title.get()),
-                privacy_show_msg=bool(self.var_privacy_show_msg.get()),
-                max_preview_chars=preview_chars,
-                max_pop_notification=max_pop,
-            )
-            if self.running and self.manager:
-                self.manager.cfg.popup_position = self._popup_pos_key_from_label(self.var_popup_pos.get())
-                self.manager.cfg.notification_font_size = self._notif_font_key_from_label(
-                    self.var_notif_font.get()
-                )
-                self.manager.cfg.notification_width = self._notif_width_key_from_label(
-                    self.var_notif_width.get()
-                )
-                self.manager.cfg.privacy_show_title = bool(self.var_privacy_show_title.get())
-                self.manager.cfg.privacy_show_msg = bool(self.var_privacy_show_msg.get())
-                self.manager.cfg.max_preview_chars = preview_chars
-                self.manager.cfg.max_pop_notification = max_pop
-                self.manager.cfg.auto_backup_enable = bool(self.var_auto_backup.get())
-                self.manager.cfg.auto_backup_path = self.var_auto_backup_path.get().strip()
-
-        self.cmb_popup_pos.bind("<<ComboboxSelected>>", _sync_popup_ui_settings)
-        self.cmb_notif_font.bind("<<ComboboxSelected>>", _sync_popup_ui_settings)
-        self.cmb_notif_width.bind("<<ComboboxSelected>>", _sync_popup_ui_settings)
-        self.ent_max_preview.bind("<FocusOut>", _sync_popup_ui_settings)
-        self.ent_max_preview.bind("<Return>", _sync_popup_ui_settings)
-        self.var_auto_backup.trace_add("write", lambda *_: _sync_popup_ui_settings())
-        self.ent_auto_backup_path.bind("<FocusOut>", _sync_popup_ui_settings)
-
-        self.privacy_frm = tb.Labelframe(frm, text="隐私设置", padding=6)
-        self.privacy_frm.pack(fill=X, anchor=W, pady=(4, 4))
-
-        self.var_privacy_show_title = tk.BooleanVar(value=getattr(self.cfg, "privacy_show_title", True))
-        self.ui["chk_privacy_show_title"] = tb.Checkbutton(
-            self.privacy_frm,
-            text="显示通知标题（发件人/会话标题）",
-            variable=self.var_privacy_show_title,
-            bootstyle="round-toggle",
-            command=_sync_popup_ui_settings,
-        )
-        self.ui["chk_privacy_show_title"].pack(anchor=W, pady=(0, 1))
-        self.ui["lbl_privacy_show_title_hint"] = tb.Label(
-            self.privacy_frm, text="", bootstyle="secondary", wraplength=520, justify=LEFT
-        )
-        self.ui["lbl_privacy_show_title_hint"].pack(anchor=W, pady=(0, 3))
-
-        self.var_privacy_show_msg = tk.BooleanVar(value=getattr(self.cfg, "privacy_show_msg", True))
-        self.ui["chk_privacy_show_msg"] = tb.Checkbutton(
-            self.privacy_frm,
-            text="显示通知消息内容（消息正文）",
-            variable=self.var_privacy_show_msg,
-            bootstyle="round-toggle",
-            command=_sync_popup_ui_settings,
-        )
-        self.ui["chk_privacy_show_msg"].pack(anchor=W, pady=(0, 1))
-        self.ui["lbl_privacy_show_msg_hint"] = tb.Label(
-            self.privacy_frm, text="", bootstyle="secondary", wraplength=520, justify=LEFT
-        )
-        self.ui["lbl_privacy_show_msg_hint"].pack(anchor=W)
-
-        def _on_toast_toggle():
-            if self.running and self.manager:
-                self.manager.cfg.enable_windows_toast = bool(self.var_win_toast.get())
-
-        self.var_win_toast.trace_add("write", lambda *_: _on_toast_toggle())
-        self._enable_hidden_scroll(frm)
+        self.ui["lbl_about_author"].pack(anchor=W)
 
     def _build_history(self):
         frm = tb.Frame(self.tab_history, padding=12)
@@ -2068,6 +2235,7 @@ class App(tb.Window):
 
         self.running = True
         self.apply_i18n()
+        self._update_sidebar_status()
         self.manager.start_all(addrs)
         self.log("[UI] started")
 
@@ -2076,6 +2244,7 @@ class App(tb.Window):
             return
         self.running = False
         self.apply_i18n()
+        self._update_sidebar_status()
         self.manager.stop_all()
         self.log("[UI] stopped")
 

@@ -10,9 +10,13 @@ from __future__ import annotations
 from typing import Any
 
 # ---------- 全局颜色 ----------
-MAIN_BG = "#F7F9FC"
+MAIN_BG = "#F3F7FC"
 PAGE_BG_COLOR = MAIN_BG  # 别名：页面/滚动容器背景
 CARD_BG = "#FFFFFF"
+CARD_HOVER_BG = "#E8F0FC"
+CARD_RADIUS = 14
+SIDEBAR_WIDTH = 220
+SIDEBAR_ACTIVE_BG = "#E8F0FC"
 PRIMARY_BLUE = "#2382dd"
 TEXT_MAIN = "#1C1C1C"
 TEXT_SECONDARY = "#6B7280"
