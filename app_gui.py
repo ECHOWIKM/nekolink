@@ -8,7 +8,7 @@ import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import messagebox, filedialog
-from typing import Optional
+from typing import Callable, Dict, Optional, Tuple
 from ttkbootstrap.scrolled import ScrolledFrame
 import ttkbootstrap as tb
 from ttkbootstrap.constants import *
@@ -19,6 +19,7 @@ from ancs_bridge import (
     BridgeManager,
     PUSH_TEMPLATE_PRESETS,
     PUSH_TEMPLATE_VARS,
+    build_test_push_payload,
     format_ancs_date,
     get_app_display_name,
     get_device_display_name,
@@ -29,11 +30,20 @@ from ancs_bridge import (
     resolve_raw_msg,
     resolve_raw_title,
     save_config,
+    send_bark,
+    send_custom_http,
     send_dingtalk_text,
     send_email,
-    send_telegram,
+    send_feishu,
     send_gotify,
     send_ntfy,
+    send_pushdeer,
+    send_pushover,
+    send_pushplus,
+    send_serverchan,
+    send_telegram,
+    send_wecom,
+    send_wxpusher,
 )
 from tray_helper import TrayController
 from popup_toast import (
@@ -83,6 +93,64 @@ from ui_shell import (
 CONFIG_PATH = get_config_path()
 ICON_PATH = "icon.ico"
 DEFAULT_TRAY_ICON_REL = "assets/icon.ico"
+
+# 推送目标页 UI 色板（仅展示）
+DEST_CARD_BG = "#FAFCFF"
+DEST_CARD_BORDER = "#E8ECF5"
+DEST_PRIMARY = "#5b8def"
+DEST_TEXT = "#111827"
+DEST_TEXT_SEC = "#6b7280"
+DEST_SUCCESS = "#22c55e"
+DEST_CARD_ACTIVE_BG = "#E8F0FC"
+# 左右分栏：左栏宽度随卡片尺寸自动适配（3 列 × 150 + 间距）
+DEST_CARD_SIZE = 150          # 卡片宽高（px），改这里
+DEST_CARD_PAD = 10
+DEST_ICON_EMOJI_SIZE = 36       # emoji 字号（px）；改这里调图标大小
+DEST_ICON_TEXT_GAP = 4        # 图标与文字间距（px）
+DEST_CARD_INNER_PAD = 12      # 卡片内边距（px）
+DEST_LEFT_W = DEST_CARD_SIZE * 3 + DEST_CARD_PAD * 4 + 16  # 150×3 网格 + 边距
+DEST_RIGHT_MIN_W = 400
+DEST_RIGHT_MAX_W = 420
+DEST_FORM_SHELL_W = 420
+DEST_FORM_MAX_W = 360       # 表单字段最大可用宽度（px 级约束靠 grid EW）
+DEST_FORM_ENTRY_W = 36      # Text 等仍用字符宽时的参考值
+DEST_FORM_ROW_PAD = 10
+DEST_BTN_W = 8
+DEST_BTN_GAP = 12
+
+DEST_SERVICES = (
+    ("telegram", "✈️", "Telegram"),
+    ("dingtalk", "🔔", "DingTalk"),
+    ("ntfy", "🔕", "ntfy.sh"),
+    ("webhook", "🌐", "Webhook"),
+    ("gotify", "📤", "Gotify"),
+    ("custom_http", "🔗", "HTTP POST"),
+    ("feishu", "🦅", "飞书"),
+    ("pushdeer", "🦌", "PushDeer"),
+    ("bark", "🐶", "Bark"),
+    ("pushplus", "➕", "PushPlus"),
+    ("wxpusher", "💬", "WxPusher"),
+    ("serverchan", "📢", "Server酱"),
+    ("pushover", "🐾", "Pushover"),
+    ("wecom", "🏢", "企业微信"),
+)
+
+DEST_TITLES = {
+    "telegram": "Telegram",
+    "dingtalk": "DingTalk",
+    "ntfy": "ntfy.sh",
+    "webhook": "Webhook",
+    "gotify": "Gotify",
+    "custom_http": "HTTP POST",
+    "feishu": "飞书群机器人",
+    "pushdeer": "PushDeer",
+    "bark": "Bark",
+    "pushplus": "PushPlus",
+    "wxpusher": "WxPusher",
+    "serverchan": "ServerChan",
+    "pushover": "Pushover",
+    "wecom": "企业微信群机器人",
+}
 
 # ---------------------------------------------------------------------------
 # 历史消息内存 / 磁盘评估（注释说明，非自动备份业务）
@@ -592,7 +660,15 @@ class App(tb.Window):
             )
             self.ui["lbl_about_author"].config(text=i18n.t("about_author"))
 
-        # devices
+        # devices (dest page uses card grid; BLE devices panel unchanged)
+        if "lbl_dest_title" in self.ui:
+            self.ui["lbl_dest_title"].config(text=i18n.t("nav_dest"))
+            self.ui["lbl_dest_subtitle"].config(text=i18n.t("dest_subtitle"))
+        self._refresh_dest_cards()
+        if getattr(self, "selected_push_service", None):
+            self._render_dest_detail_form(self.selected_push_service)
+        else:
+            self._show_dest_detail_placeholder()
         if "lbl_devices_title" in self.ui:
             self.ui["lbl_devices_title"].config(text=i18n.t("selected_ble"))
             self.ui["btn_scan"].config(text=i18n.t("scan"))
@@ -901,136 +977,72 @@ class App(tb.Window):
         # 仅更新界面与内存；点顶部【保存】才写入 config.json
         self.log(f"[UI] 设备别名已更新（未落盘）: {addr} -> {alias or '(空)'}")
 
-    # ✅ Destinations: 隐藏滚动条 + 无页内保存
-    def _build_dest(self):
-        frm = self._make_hidden_scrolled(self.tab_dest)
-
-        # Telegram
-        tg = tb.Labelframe(frm, text="Telegram", padding=10)
-        tg.pack(fill=X, pady=(0, 12))
-
+    def _init_dest_vars(self) -> None:
+        """初始化推送目标相关变量（业务字段名与 collect_config 保持一致）。"""
         self.var_tg_on = tk.BooleanVar(value=self.cfg.enable_telegram)
         self.var_tg_token = tk.StringVar(value=self.cfg.telegram_bot_token)
         self.var_tg_chat = tk.StringVar(value=self.cfg.telegram_chat_id)
-
-        tb.Checkbutton(tg, text="Enable Telegram", variable=self.var_tg_on, bootstyle="round-toggle").grid(
-            row=0, column=0, sticky=W, pady=(0, 6)
-        )
-        tb.Label(tg, text="Bot Token").grid(row=1, column=0, sticky=W)
-        self.ent_tg_token = tb.Entry(tg, textvariable=self.var_tg_token, width=70, show="•")
-        self.ent_tg_token.grid(row=1, column=1, sticky=W, pady=2)
-        self._tg_token_hidden = True
-
-        def toggle_tg_token():
-            self._tg_token_hidden = not self._tg_token_hidden
-            self.ent_tg_token.config(show=("•" if self._tg_token_hidden else ""))
-
-        tb.Button(tg, text="👁", width=3, bootstyle="secondary", command=toggle_tg_token).grid(
-            row=1, column=2, sticky=W, padx=(6, 0)
-        )
-
-        tb.Label(tg, text="Chat ID").grid(row=2, column=0, sticky=W)
-        tb.Entry(tg, textvariable=self.var_tg_chat, width=30).grid(row=2, column=1, sticky=W, pady=2)
-        tb.Button(tg, text="Test", bootstyle="success", command=self.test_telegram).grid(
-            row=3, column=1, sticky=W, pady=(8, 0)
-        )
-
-        # DingTalk
-        dt = tb.Labelframe(frm, text="DingTalk (Robot)", padding=10)
-        dt.pack(fill=X, pady=(0, 12))
 
         self.var_dt_on = tk.BooleanVar(value=getattr(self.cfg, "enable_dingtalk", False))
         self.var_dt_webhook = tk.StringVar(value=getattr(self.cfg, "dingtalk_webhook", ""))
         self.var_dt_secret = tk.StringVar(value=getattr(self.cfg, "dingtalk_secret", ""))
 
-        tb.Checkbutton(dt, text="Enable DingTalk", variable=self.var_dt_on, bootstyle="round-toggle").grid(
-            row=0, column=0, sticky=W, pady=(0, 6)
-        )
-        tb.Label(dt, text="Webhook").grid(row=1, column=0, sticky=W)
-        tb.Entry(dt, textvariable=self.var_dt_webhook, width=78).grid(row=1, column=1, sticky=W, pady=2)
-
-        tb.Label(dt, text="Secret (sign)").grid(row=2, column=0, sticky=W)
-        self.ent_dt_secret = tb.Entry(dt, textvariable=self.var_dt_secret, width=36, show="•")
-        self.ent_dt_secret.grid(row=2, column=1, sticky=W, pady=2)
-        self._dt_secret_hidden = True
-
-        def toggle_dt_secret():
-            self._dt_secret_hidden = not self._dt_secret_hidden
-            self.ent_dt_secret.config(show=("•" if self._dt_secret_hidden else ""))
-
-        tb.Button(dt, text="👁", width=3, bootstyle="secondary", command=toggle_dt_secret).grid(
-            row=2, column=2, sticky=W, padx=(6, 0)
-        )
-        tb.Button(dt, text="Test", bootstyle="success", command=self.test_dingtalk).grid(
-            row=3, column=1, sticky=W, pady=(8, 0)
-        )
-
-        # ntfy
-        nf = tb.Labelframe(frm, text="ntfy.sh", padding=10)
-        nf.pack(fill=X, pady=(0, 12))
-
         self.var_ntfy_on = tk.BooleanVar(value=getattr(self.cfg, "enable_ntfy", False))
         self.var_ntfy_url = tk.StringVar(value=getattr(self.cfg, "ntfy_url", ""))
 
-        tb.Checkbutton(nf, text="Enable ntfy", variable=self.var_ntfy_on, bootstyle="round-toggle").grid(
-            row=0, column=0, sticky=W, pady=(0, 6)
-        )
-        tb.Label(nf, text="Topic URL").grid(row=1, column=0, sticky=W)
-        tb.Entry(nf, textvariable=self.var_ntfy_url, width=78).grid(row=1, column=1, sticky=W, pady=2)
-        tb.Button(nf, text="Test", bootstyle="success", command=self.test_ntfy).grid(
-            row=2, column=1, sticky=W, pady=(8, 0)
-        )
-
-        wh = tb.Labelframe(frm, text="Webhook 消息长度", padding=10)
-        wh.pack(fill=X, pady=(0, 12))
         self.var_webhook_full = tk.BooleanVar(
             value=bool(getattr(self.cfg, "webhook_use_full_message", True))
         )
-        tb.Checkbutton(
-            wh,
-            text="Webhook/TG/Gotify/邮件发送完整原文（关闭则发送预览省略文本）",
-            variable=self.var_webhook_full,
-            bootstyle="round-toggle",
-        ).pack(anchor=W)
-
-        # Gotify
-        gf = tb.Labelframe(frm, text="Gotify", padding=10)
-        gf.pack(fill=X, pady=(0, 12))
 
         self.var_gotify_on = tk.BooleanVar(value=getattr(self.cfg, "enable_gotify", False))
         self.var_gotify_url = tk.StringVar(value=getattr(self.cfg, "gotify_url", ""))
         self.var_gotify_token = tk.StringVar(value=getattr(self.cfg, "gotify_token", ""))
         self.var_gotify_prio = tk.StringVar(value=str(getattr(self.cfg, "gotify_priority", 5)))
 
-        tb.Checkbutton(gf, text="Enable Gotify", variable=self.var_gotify_on, bootstyle="round-toggle").grid(
-            row=0, column=0, sticky=W, pady=(0, 6)
+        self.var_custom_http_on = tk.BooleanVar(value=getattr(self.cfg, "enable_custom_http", False))
+        self.var_custom_http_url = tk.StringVar(value=getattr(self.cfg, "custom_http_url", ""))
+        self.var_custom_http_headers = tk.StringVar(
+            value=getattr(self.cfg, "custom_http_headers_json", "{}")
         )
-        tb.Label(gf, text="Server URL").grid(row=1, column=0, sticky=W)
-        tb.Entry(gf, textvariable=self.var_gotify_url, width=60).grid(row=1, column=1, sticky=W, pady=2)
-
-        tb.Label(gf, text="App Token").grid(row=2, column=0, sticky=W)
-        self.ent_gotify_token = tb.Entry(gf, textvariable=self.var_gotify_token, width=36, show="•")
-        self.ent_gotify_token.grid(row=2, column=1, sticky=W, pady=2)
-        self._gotify_token_hidden = True
-
-        def toggle_gotify_token():
-            self._gotify_token_hidden = not self._gotify_token_hidden
-            self.ent_gotify_token.config(show=("•" if self._gotify_token_hidden else ""))
-
-        tb.Button(gf, text="👁", width=3, bootstyle="secondary", command=toggle_gotify_token).grid(
-            row=2, column=2, sticky=W, padx=(6, 0)
+        self.var_custom_http_body = tk.StringVar(
+            value=getattr(
+                self.cfg,
+                "custom_http_body_template",
+                '{"title":"{{title}}","msg":"{{msg}}","app":"{{app_name}}",'
+                '"device":"{{device_name}}","time":"{{date_time}}"}',
+            )
         )
 
-        tb.Label(gf, text="Priority").grid(row=3, column=0, sticky=W)
-        tb.Entry(gf, textvariable=self.var_gotify_prio, width=8).grid(row=3, column=1, sticky=W, pady=2)
-        tb.Button(gf, text="Test", bootstyle="success", command=self.test_gotify).grid(
-            row=4, column=1, sticky=W, pady=(8, 0)
-        )
+        self.var_feishu_on = tk.BooleanVar(value=getattr(self.cfg, "enable_feishu", False))
+        self.var_feishu_webhook = tk.StringVar(value=getattr(self.cfg, "feishu_webhook_url", ""))
 
-        # Email
-        mail = tb.Labelframe(frm, text="Email (SMTP)", padding=10)
-        mail.pack(fill=X)
+        self.var_pushdeer_on = tk.BooleanVar(value=getattr(self.cfg, "enable_pushdeer", False))
+        self.var_pushdeer_key = tk.StringVar(value=getattr(self.cfg, "pushdeer_key", ""))
 
+        self.var_bark_on = tk.BooleanVar(value=getattr(self.cfg, "enable_bark", False))
+        self.var_bark_key = tk.StringVar(value=getattr(self.cfg, "bark_api_key", ""))
+        self.var_bark_sound = tk.StringVar(value=getattr(self.cfg, "bark_sound", ""))
+
+        self.var_pushplus_on = tk.BooleanVar(value=getattr(self.cfg, "enable_pushplus", False))
+        self.var_pushplus_token = tk.StringVar(value=getattr(self.cfg, "pushplus_token", ""))
+
+        self.var_wxpusher_on = tk.BooleanVar(value=getattr(self.cfg, "enable_wxpusher", False))
+        self.var_wxpusher_token = tk.StringVar(value=getattr(self.cfg, "wxpusher_app_token", ""))
+        self.var_wxpusher_topic = tk.StringVar(value=getattr(self.cfg, "wxpusher_topic_id", ""))
+
+        self.var_serverchan_on = tk.BooleanVar(value=getattr(self.cfg, "enable_serverchan", False))
+        self.var_serverchan_key = tk.StringVar(value=getattr(self.cfg, "serverchan_sendkey", ""))
+
+        self.var_pushover_on = tk.BooleanVar(value=getattr(self.cfg, "enable_pushover", False))
+        self.var_pushover_token = tk.StringVar(value=getattr(self.cfg, "pushover_api_token", ""))
+        self.var_pushover_user = tk.StringVar(value=getattr(self.cfg, "pushover_user_key", ""))
+
+        self.var_wecom_on = tk.BooleanVar(value=getattr(self.cfg, "enable_wecom", False))
+        self.var_wecom_webhook = tk.StringVar(value=getattr(self.cfg, "wecom_webhook_url", ""))
+
+        self._dest_text_syncers: list = []
+
+        # Email：无卡片入口，保留变量供 collect_config / 全局保存
         self.var_mail_on = tk.BooleanVar(value=self.cfg.enable_email)
         self.var_smtp_host = tk.StringVar(value=self.cfg.smtp_host)
         self.var_smtp_port = tk.StringVar(value=str(self.cfg.smtp_port))
@@ -1039,38 +1051,567 @@ class App(tb.Window):
         self.var_email_from = tk.StringVar(value=self.cfg.email_from)
         self.var_email_to = tk.StringVar(value=self.cfg.email_to)
 
-        tb.Checkbutton(mail, text="Enable Email", variable=self.var_mail_on, bootstyle="round-toggle").grid(
-            row=0, column=0, sticky=W, pady=(0, 6)
+    def _dest_is_configured(self, key: str) -> bool:
+        if key == "telegram":
+            return bool(self.var_tg_token.get().strip() and self.var_tg_chat.get().strip())
+        if key == "dingtalk":
+            return bool(self.var_dt_webhook.get().strip())
+        if key == "ntfy":
+            return bool(self.var_ntfy_url.get().strip())
+        if key == "webhook":
+            return True
+        if key == "gotify":
+            return bool(self.var_gotify_url.get().strip() and self.var_gotify_token.get().strip())
+        if key == "custom_http":
+            return bool(self.var_custom_http_url.get().strip())
+        if key == "feishu":
+            return bool(self.var_feishu_webhook.get().strip())
+        if key == "pushdeer":
+            return bool(self.var_pushdeer_key.get().strip())
+        if key == "bark":
+            return bool(self.var_bark_key.get().strip())
+        if key == "pushplus":
+            return bool(self.var_pushplus_token.get().strip())
+        if key == "wxpusher":
+            return bool(self.var_wxpusher_token.get().strip())
+        if key == "serverchan":
+            return bool(self.var_serverchan_key.get().strip())
+        if key == "pushover":
+            return bool(self.var_pushover_token.get().strip() and self.var_pushover_user.get().strip())
+        if key == "wecom":
+            return bool(self.var_wecom_webhook.get().strip())
+        return False
+
+    def _dest_is_enabled(self, key: str) -> bool:
+        mapping = {
+            "telegram": self.var_tg_on,
+            "dingtalk": self.var_dt_on,
+            "ntfy": self.var_ntfy_on,
+            "webhook": self.var_webhook_full,
+            "gotify": self.var_gotify_on,
+            "custom_http": self.var_custom_http_on,
+            "feishu": self.var_feishu_on,
+            "pushdeer": self.var_pushdeer_on,
+            "bark": self.var_bark_on,
+            "pushplus": self.var_pushplus_on,
+            "wxpusher": self.var_wxpusher_on,
+            "serverchan": self.var_serverchan_on,
+            "pushover": self.var_pushover_on,
+            "wecom": self.var_wecom_on,
+        }
+        var = mapping.get(key)
+        return bool(var.get()) if var else False
+
+    def _refresh_dest_cards(self) -> None:
+        cards = getattr(self, "_dest_cards", {}) or {}
+        for key, widgets in cards.items():
+            cfg_lbl = widgets.get("cfg_lbl")
+            en_lbl = widgets.get("en_lbl")
+            if not cfg_lbl or not en_lbl:
+                continue
+            configured = self._dest_is_configured(key)
+            enabled = self._dest_is_enabled(key)
+            cfg_lbl.configure(
+                text=i18n.t("dest_configured") if configured else i18n.t("dest_not_configured"),
+                fg=DEST_SUCCESS if configured else DEST_TEXT_SEC,
+            )
+            en_lbl.configure(
+                text=i18n.t("dest_enabled") if enabled else i18n.t("dest_disabled"),
+                fg=DEST_SUCCESS if enabled else DEST_TEXT_SEC,
+            )
+        self._highlight_dest_card(getattr(self, "selected_push_service", None))
+
+    def _highlight_dest_card(self, key: Optional[str]) -> None:
+        """左栏卡片选中高亮：仅背景/边框色，严禁改宽高。"""
+        cards = getattr(self, "_dest_cards", {}) or {}
+        for k, widgets in cards.items():
+            card = widgets.get("card")
+            inner = widgets.get("inner")
+            active = k == key
+            bg = DEST_CARD_ACTIVE_BG if active else DEST_CARD_BG
+            border = DEST_PRIMARY if active else DEST_CARD_BORDER
+            if card:
+                card.configure(bg=bg, highlightbackground=border)
+            if inner:
+                inner.configure(bg=bg)
+                for child in inner.winfo_children():
+                    try:
+                        child.configure(bg=bg)
+                    except Exception:
+                        pass
+            for lbl in (
+                widgets.get("cfg_lbl"),
+                widgets.get("en_lbl"),
+                widgets.get("name_lbl"),
+                widgets.get("icon_lbl"),
+            ):
+                if lbl:
+                    lbl.configure(bg=bg)
+            icon_zone = widgets.get("icon_zone")
+            if icon_zone:
+                icon_zone.configure(bg=bg)
+
+    def _create_dest_service_card(self, parent, key: str, emoji: str, name: str) -> tk.Frame:
+        # 150×150 正方形；emoji 负字号=像素；自上而下紧凑排版，避免图标区留白
+        card = tk.Frame(
+            parent,
+            width=DEST_CARD_SIZE,
+            height=DEST_CARD_SIZE,
+            bg=DEST_CARD_BG,
+            highlightthickness=1,
+            highlightbackground=DEST_CARD_BORDER,
+            cursor="hand2",
         )
-        tb.Label(mail, text="Host").grid(row=1, column=0, sticky=W)
-        tb.Entry(mail, textvariable=self.var_smtp_host, width=36).grid(row=1, column=1, sticky=W, pady=2)
-        tb.Label(mail, text="Port").grid(row=1, column=2, sticky=W)
-        tb.Entry(mail, textvariable=self.var_smtp_port, width=8).grid(row=1, column=3, sticky=W, pady=2)
+        card.grid_propagate(False)
+        card.pack_propagate(False)
 
-        tb.Label(mail, text="User").grid(row=2, column=0, sticky=W)
-        tb.Entry(mail, textvariable=self.var_smtp_user, width=36).grid(row=2, column=1, sticky=W, pady=2)
-
-        tb.Label(mail, text="Pass").grid(row=3, column=0, sticky=W)
-        self.ent_smtp_pass = tb.Entry(mail, textvariable=self.var_smtp_pass, width=32, show="•")
-        self.ent_smtp_pass.grid(row=3, column=1, sticky=W, pady=2)
-        self._smtp_pass_hidden = True
-
-        def toggle_smtp_pass():
-            self._smtp_pass_hidden = not self._smtp_pass_hidden
-            self.ent_smtp_pass.config(show=("•" if self._smtp_pass_hidden else ""))
-
-        tb.Button(mail, text="👁", width=3, bootstyle="secondary", command=toggle_smtp_pass).grid(
-            row=3, column=2, sticky=W, padx=(6, 0)
+        stack = tk.Frame(card, bg=DEST_CARD_BG, cursor="hand2")
+        stack.pack(
+            fill=BOTH,
+            expand=True,
+            padx=DEST_CARD_INNER_PAD,
+            pady=DEST_CARD_INNER_PAD,
         )
 
-        tb.Label(mail, text="From").grid(row=4, column=0, sticky=W)
-        tb.Entry(mail, textvariable=self.var_email_from, width=36).grid(row=4, column=1, sticky=W, pady=2)
-        tb.Label(mail, text="To").grid(row=5, column=0, sticky=W)
-        tb.Entry(mail, textvariable=self.var_email_to, width=36).grid(row=5, column=1, sticky=W, pady=2)
-        tb.Button(mail, text="Test", bootstyle="success", command=self.test_email).grid(
-            row=6, column=1, sticky=W, pady=(8, 0)
+        icon_lbl = tk.Label(
+            stack,
+            text=emoji,
+            bg=DEST_CARD_BG,
+            font=("Segoe UI Emoji", -DEST_ICON_EMOJI_SIZE),
+            anchor=CENTER,
+            justify=CENTER,
+            cursor="hand2",
         )
-        self._enable_hidden_scroll(frm)
+        icon_lbl.pack(anchor=CENTER)
+
+        name_lbl = tk.Label(
+            stack,
+            text=name,
+            bg=DEST_CARD_BG,
+            fg=DEST_TEXT,
+            font=("Segoe UI", 10, "bold"),
+            wraplength=DEST_CARD_SIZE - DEST_CARD_INNER_PAD * 2,
+            justify=CENTER,
+            anchor=CENTER,
+            cursor="hand2",
+        )
+        name_lbl.pack(anchor=CENTER, pady=(DEST_ICON_TEXT_GAP, 0))
+
+        cfg_lbl = tk.Label(
+            stack,
+            text="",
+            bg=DEST_CARD_BG,
+            fg=DEST_TEXT_SEC,
+            font=("Segoe UI", 9),
+            anchor=CENTER,
+            justify=CENTER,
+            cursor="hand2",
+        )
+        cfg_lbl.pack(anchor=CENTER, pady=(2, 0))
+        en_lbl = tk.Label(
+            stack,
+            text="",
+            bg=DEST_CARD_BG,
+            fg=DEST_TEXT_SEC,
+            font=("Segoe UI", 9),
+            anchor=CENTER,
+            justify=CENTER,
+            cursor="hand2",
+        )
+        en_lbl.pack(anchor=CENTER, pady=(1, 0))
+
+        self._dest_cards[key] = {
+            "card": card,
+            "inner": stack,
+            "icon_zone": None,
+            "icon_lbl": icon_lbl,
+            "name_lbl": name_lbl,
+            "cfg_lbl": cfg_lbl,
+            "en_lbl": en_lbl,
+        }
+
+        def _select(_e=None, k=key):
+            self._select_push_service(k)
+
+        for w in (card, stack, icon_lbl, name_lbl, cfg_lbl, en_lbl):
+            w.bind("<Button-1>", _select)
+        return card
+
+    def _hide_dest_form(self) -> None:
+        """隐藏右侧表单，恢复占位提示。"""
+        self.selected_push_service = None
+        self._highlight_dest_card(None)
+        self._show_dest_detail_placeholder()
+
+    def _clear_dest_form_inner(self) -> None:
+        """只销毁右栏【动态表单内层】子组件，保留外层 Frame。"""
+        host = self.ui.get("dest_form_inner")
+        if not host:
+            return
+        for w in host.winfo_children():
+            w.destroy()
+
+    def _show_dest_detail_placeholder(self) -> None:
+        self._clear_dest_form_inner()
+        host = self.ui.get("dest_form_inner")
+        if not host:
+            return
+        wrap = tk.Frame(host, bg=DEST_CARD_BG)
+        wrap.pack(fill=BOTH, expand=True)
+        tk.Label(
+            wrap,
+            text=i18n.t("dest_select_hint"),
+            bg=DEST_CARD_BG,
+            fg=DEST_TEXT_SEC,
+            font=("Segoe UI", 11),
+            justify=CENTER,
+            wraplength=DEST_FORM_MAX_W,
+        ).place(relx=0.5, rely=0.5, anchor=CENTER)
+
+    def _dest_form_secret_row(self, parent, row: int, label: str, var: tk.StringVar) -> int:
+        pad = DEST_FORM_ROW_PAD
+        tb.Label(parent, text=label).grid(row=row, column=0, sticky=W, pady=(0, 4))
+        ent_row = tb.Frame(parent)
+        ent_row.grid(row=row + 1, column=0, sticky=EW, pady=(0, pad))
+        ent_row.grid_columnconfigure(0, weight=1)
+        ent_row.grid_columnconfigure(1, weight=0)
+        ent = tb.Entry(ent_row, textvariable=var, show="•")
+        ent.grid(row=0, column=0, sticky=EW)
+        hidden = {"v": True}
+
+        def toggle():
+            hidden["v"] = not hidden["v"]
+            ent.configure(show="•" if hidden["v"] else "")
+
+        tb.Button(ent_row, text="👁", width=3, bootstyle="secondary", command=toggle).grid(
+            row=0, column=1, padx=(6, 0), sticky=E
+        )
+        return row + 2
+
+    def _dest_form_add_actions(self, parent, row: int, test_cmd=None) -> None:
+        btns = tb.Frame(parent)
+        btns.grid(row=row, column=0, sticky=W, pady=(DEST_FORM_ROW_PAD, 0))
+
+        def _save():
+            self._sync_dest_text_widgets()
+            self._persist_config(show_msg=True)
+            self._refresh_dest_cards()
+
+        if test_cmd:
+            tb.Button(
+                btns, text="测试", width=DEST_BTN_W, bootstyle="success", command=test_cmd
+            ).pack(side=LEFT, padx=(0, DEST_BTN_GAP))
+        tb.Button(
+            btns, text=i18n.t("save"), width=DEST_BTN_W, bootstyle="primary", command=_save
+        ).pack(side=LEFT, padx=(0, DEST_BTN_GAP))
+        tb.Button(
+            btns, text="隐藏", width=DEST_BTN_W, bootstyle="secondary", command=self._hide_dest_form
+        ).pack(side=LEFT)
+
+    def _sync_dest_text_widgets(self) -> None:
+        for fn in getattr(self, "_dest_text_syncers", []) or []:
+            try:
+                fn()
+            except Exception:
+                pass
+
+    def _dest_form_enable_row(self, shell, row: int, text: str, var: tk.BooleanVar, pad: int) -> int:
+        tb.Checkbutton(shell, text=text, variable=var, bootstyle="round-toggle").grid(
+            row=row, column=0, sticky=W, pady=(0, pad)
+        )
+        return row + 1
+
+    def _dest_form_entry_row(
+        self, shell, row: int, label: str, var: tk.StringVar, pad: int, *, width: int = DEST_FORM_ENTRY_W
+    ) -> int:
+        tb.Label(shell, text=label).grid(row=row, column=0, sticky=W, pady=(0, 4))
+        tb.Entry(shell, textvariable=var, width=width).grid(
+            row=row + 1, column=0, sticky=EW, pady=(0, pad)
+        )
+        return row + 2
+
+    def _dest_form_text_area(
+        self, shell, row: int, label: str, var: tk.StringVar, pad: int, *, height: int = 3
+    ) -> int:
+        tb.Label(shell, text=label).grid(row=row, column=0, sticky=NW, pady=(0, 4))
+        txt = tk.Text(shell, width=DEST_FORM_ENTRY_W, height=height, wrap=WORD, font=("Segoe UI", 9))
+        txt.grid(row=row + 1, column=0, sticky=EW, pady=(0, pad))
+        txt.insert("1.0", var.get())
+
+        def _sync(_e=None):
+            var.set(txt.get("1.0", "end-1c"))
+
+        txt.bind("<FocusOut>", _sync)
+        self._dest_text_syncers.append(_sync)
+        return row + 2
+
+    def _dest_test_async(self, channel: str, validate, run_test: Callable[[], None]) -> None:
+        """后台线程执行 Test，避免阻塞 UI。"""
+        self._sync_dest_text_widgets()
+        err = validate()
+        if err:
+            messagebox.showwarning(i18n.t("missing"), err)
+            return
+
+        def worker():
+            try:
+                run_test()
+                self.after(0, lambda: messagebox.showinfo(i18n.t("ok"), f"{channel} test sent"))
+            except Exception as e:
+                self.log(f"[TEST:{channel}] failed: {e}")
+                self.after(0, lambda: messagebox.showerror(i18n.t("fail"), f"{channel} failed: {e}"))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _dest_test_content(self) -> Tuple[str, str, dict]:
+        payload = build_test_push_payload()
+        cfg = self.collect_config()
+        title = "NekoLink Test"
+        text = render_push_template(cfg.push_template, payload, cfg)
+        return title, text, payload
+
+    def _dest_build_form_telegram(self, shell, row: int, pad: int):
+        row = self._dest_form_enable_row(shell, row, "Enable Telegram", self.var_tg_on, pad)
+        row = self._dest_form_secret_row(shell, row, "Bot Token", self.var_tg_token)
+        row = self._dest_form_entry_row(shell, row, "Chat ID", self.var_tg_chat, pad)
+        return row, self.test_telegram
+
+    def _dest_build_form_dingtalk(self, shell, row: int, pad: int):
+        row = self._dest_form_enable_row(shell, row, "Enable DingTalk", self.var_dt_on, pad)
+        row = self._dest_form_entry_row(shell, row, "Webhook", self.var_dt_webhook, pad)
+        row = self._dest_form_secret_row(shell, row, "Secret (sign)", self.var_dt_secret)
+        return row, self.test_dingtalk
+
+    def _dest_build_form_ntfy(self, shell, row: int, pad: int):
+        row = self._dest_form_enable_row(shell, row, "Enable ntfy", self.var_ntfy_on, pad)
+        row = self._dest_form_entry_row(shell, row, "Topic URL", self.var_ntfy_url, pad)
+        return row, self.test_ntfy
+
+    def _dest_build_form_webhook(self, shell, row: int, pad: int):
+        row = self._dest_form_enable_row(shell, row, "Enable Webhook", self.var_webhook_full, pad)
+        tb.Label(
+            shell,
+            text="Webhook/TG/Gotify/邮件发送完整原文（关闭则发送预览省略文本）",
+            wraplength=DEST_FORM_MAX_W,
+            bootstyle="secondary",
+            justify=LEFT,
+        ).grid(row=row, column=0, sticky=W, pady=(0, pad))
+        row += 1
+        tb.Label(
+            shell,
+            text="机器人 Webhook URL 请在 DingTalk / 企业微信等卡片中配置。",
+            wraplength=DEST_FORM_MAX_W,
+            bootstyle="secondary",
+            justify=LEFT,
+        ).grid(row=row, column=0, sticky=W, pady=(0, pad))
+        return row + 1, None
+
+    def _dest_build_form_gotify(self, shell, row: int, pad: int):
+        row = self._dest_form_enable_row(shell, row, "Enable Gotify", self.var_gotify_on, pad)
+        row = self._dest_form_entry_row(shell, row, "Server URL", self.var_gotify_url, pad)
+        row = self._dest_form_secret_row(shell, row, "App Token", self.var_gotify_token)
+        row = self._dest_form_entry_row(shell, row, "Priority", self.var_gotify_prio, pad, width=8)
+        return row, self.test_gotify
+
+    def _dest_build_form_custom_http(self, shell, row: int, pad: int):
+        row = self._dest_form_enable_row(shell, row, "Enable HTTP POST", self.var_custom_http_on, pad)
+        row = self._dest_form_entry_row(shell, row, "POST URL", self.var_custom_http_url, pad)
+        row = self._dest_form_text_area(shell, row, "Headers JSON", self.var_custom_http_headers, pad, height=3)
+        row = self._dest_form_text_area(shell, row, "Body 模板", self.var_custom_http_body, pad, height=5)
+        tb.Label(
+            shell,
+            text="Body 变量：{{title}} {{msg}} {{app_name}} {{device_name}} {{date_time}}",
+            wraplength=DEST_FORM_MAX_W,
+            bootstyle="secondary",
+            justify=LEFT,
+        ).grid(row=row, column=0, sticky=W, pady=(0, pad))
+        return row + 1, self.test_custom_http
+
+    def _dest_build_form_feishu(self, shell, row: int, pad: int):
+        row = self._dest_form_enable_row(shell, row, "Enable 飞书", self.var_feishu_on, pad)
+        row = self._dest_form_entry_row(shell, row, "Webhook URL", self.var_feishu_webhook, pad)
+        return row, self.test_feishu
+
+    def _dest_build_form_pushdeer(self, shell, row: int, pad: int):
+        row = self._dest_form_enable_row(shell, row, "Enable PushDeer", self.var_pushdeer_on, pad)
+        row = self._dest_form_entry_row(shell, row, "PushDeer Key", self.var_pushdeer_key, pad)
+        return row, self.test_pushdeer
+
+    def _dest_build_form_bark(self, shell, row: int, pad: int):
+        row = self._dest_form_enable_row(shell, row, "Enable Bark", self.var_bark_on, pad)
+        row = self._dest_form_entry_row(shell, row, "API Key", self.var_bark_key, pad)
+        row = self._dest_form_entry_row(shell, row, "Sound (可选)", self.var_bark_sound, pad)
+        return row, self.test_bark
+
+    def _dest_build_form_pushplus(self, shell, row: int, pad: int):
+        row = self._dest_form_enable_row(shell, row, "Enable PushPlus", self.var_pushplus_on, pad)
+        row = self._dest_form_entry_row(shell, row, "Token", self.var_pushplus_token, pad)
+        return row, self.test_pushplus
+
+    def _dest_build_form_wxpusher(self, shell, row: int, pad: int):
+        row = self._dest_form_enable_row(shell, row, "Enable WxPusher", self.var_wxpusher_on, pad)
+        row = self._dest_form_entry_row(shell, row, "App Token", self.var_wxpusher_token, pad)
+        row = self._dest_form_entry_row(shell, row, "Topic ID", self.var_wxpusher_topic, pad)
+        return row, self.test_wxpusher
+
+    def _dest_build_form_serverchan(self, shell, row: int, pad: int):
+        row = self._dest_form_enable_row(shell, row, "Enable Server酱", self.var_serverchan_on, pad)
+        row = self._dest_form_entry_row(shell, row, "SendKey", self.var_serverchan_key, pad)
+        return row, self.test_serverchan
+
+    def _dest_build_form_pushover(self, shell, row: int, pad: int):
+        row = self._dest_form_enable_row(shell, row, "Enable Pushover", self.var_pushover_on, pad)
+        row = self._dest_form_entry_row(shell, row, "API Token", self.var_pushover_token, pad)
+        row = self._dest_form_entry_row(shell, row, "User Key", self.var_pushover_user, pad)
+        return row, self.test_pushover
+
+    def _dest_build_form_wecom(self, shell, row: int, pad: int):
+        row = self._dest_form_enable_row(shell, row, "Enable 企业微信", self.var_wecom_on, pad)
+        row = self._dest_form_entry_row(shell, row, "Webhook URL", self.var_wecom_webhook, pad)
+        return row, self.test_wecom
+
+    def _select_push_service(self, key: str) -> None:
+        """点击左栏卡片：切换右侧详情表单。"""
+        self.selected_push_service = key
+        self._highlight_dest_card(key)
+        self._render_dest_detail_form(key)
+
+    def _render_dest_detail_form(self, key: str) -> None:
+        """在右栏【动态表单内层】渲染配置表单；外层 Frame 永不销毁。"""
+        self._clear_dest_form_inner()
+        self._dest_text_syncers = []
+        host = self.ui.get("dest_form_inner")
+        if not host:
+            return
+
+        builders = {
+            "telegram": self._dest_build_form_telegram,
+            "dingtalk": self._dest_build_form_dingtalk,
+            "ntfy": self._dest_build_form_ntfy,
+            "webhook": self._dest_build_form_webhook,
+            "gotify": self._dest_build_form_gotify,
+            "custom_http": self._dest_build_form_custom_http,
+            "feishu": self._dest_build_form_feishu,
+            "pushdeer": self._dest_build_form_pushdeer,
+            "bark": self._dest_build_form_bark,
+            "pushplus": self._dest_build_form_pushplus,
+            "wxpusher": self._dest_build_form_wxpusher,
+            "serverchan": self._dest_build_form_serverchan,
+            "pushover": self._dest_build_form_pushover,
+            "wecom": self._dest_build_form_wecom,
+        }
+        builder = builders.get(key)
+        if not builder:
+            self._show_dest_detail_placeholder()
+            return
+
+        pad = DEST_FORM_ROW_PAD
+        form_wrap = tb.Frame(host, padding=(0, 0))
+        form_wrap.pack(anchor=NW, fill=X)
+
+        shell = tb.Frame(form_wrap)
+        shell.pack(anchor=NW, fill=X)
+        shell.grid_columnconfigure(0, weight=1)
+
+        tb.Label(
+            shell,
+            text=f"{i18n.t('dest_config_title')} {DEST_TITLES.get(key, key)}",
+            font=("Segoe UI", 13, "bold"),
+        ).grid(row=0, column=0, sticky=W, pady=(0, pad))
+
+        row, test_cmd = builder(shell, 1, pad)
+        self._dest_form_add_actions(shell, row, test_cmd)
+
+    # ✅ Destinations: 左右分栏（左栏 width=DEST_LEFT_W）+ 右栏外层永久 / 内层动态
+    def _build_dest(self):
+        self._init_dest_vars()
+        self._dest_cards: Dict[str, dict] = {}
+        self.selected_push_service = None
+
+        outer = tb.Frame(self.tab_dest, padding=(PAGE_PADX, PAGE_PADY))
+        outer.pack(fill=BOTH, expand=True)
+
+        head = tb.Frame(outer)
+        head.pack(fill=X, pady=(0, 16))
+        self.ui["lbl_dest_title"] = tb.Label(head, text=i18n.t("nav_dest"), font=("Segoe UI", 18, "bold"))
+        self.ui["lbl_dest_title"].pack(anchor=W)
+        self.ui["lbl_dest_subtitle"] = tb.Label(
+            head, text=i18n.t("dest_subtitle"), bootstyle="secondary", font=("Segoe UI", 10)
+        )
+        self.ui["lbl_dest_subtitle"].pack(anchor=W, pady=(4, 0))
+
+        scroll_host = tb.Frame(outer)
+        scroll_host.pack(fill=BOTH, expand=True)
+
+        # ── 主分栏 body：column0 锁左栏 DEST_LEFT_W；column1 weight=1 右栏留白 ──
+        body = tb.Frame(scroll_host)
+        body.pack(fill=BOTH, expand=True)
+        body.grid_columnconfigure(0, weight=0, minsize=DEST_LEFT_W)
+        body.grid_columnconfigure(1, weight=1, minsize=DEST_RIGHT_MIN_W)
+        body.grid_rowconfigure(0, weight=1)
+
+        # 左栏：固定 DEST_LEFT_W，禁止横向拉伸
+        left = tk.Frame(
+            body,
+            width=DEST_LEFT_W,
+            bg=DEST_CARD_BG,
+            highlightthickness=1,
+            highlightbackground=DEST_CARD_BORDER,
+        )
+        left.grid(row=0, column=0, sticky=NS, padx=(0, 12))
+        left.grid_propagate(False)
+
+        card_grid = tk.Frame(left, bg=DEST_CARD_BG)
+        card_grid.pack(anchor=N, padx=8, pady=8)
+        n_services = len(DEST_SERVICES)
+        n_rows = (n_services + 2) // 3
+        total_slots = n_rows * 3
+        for c in range(3):
+            card_grid.grid_columnconfigure(c, weight=0, minsize=DEST_CARD_SIZE)
+        for r in range(n_rows):
+            card_grid.grid_rowconfigure(r, weight=0, minsize=DEST_CARD_SIZE)
+
+        for idx in range(total_slots):
+            row_i, col_i = divmod(idx, 3)
+            if idx < n_services:
+                key, emoji, name = DEST_SERVICES[idx]
+                card = self._create_dest_service_card(card_grid, key, emoji, name)
+            else:
+                card = tk.Frame(
+                    card_grid,
+                    width=DEST_CARD_SIZE,
+                    height=DEST_CARD_SIZE,
+                    bg=DEST_CARD_BG,
+                )
+                card.grid_propagate(False)
+            card.grid(row=row_i, column=col_i, padx=DEST_CARD_PAD, pady=DEST_CARD_PAD)
+
+        # 右栏【外层容器】：永久保留，切换服务时不销毁
+        right_outer = tk.Frame(
+            body,
+            bg=DEST_CARD_BG,
+            highlightthickness=1,
+            highlightbackground=DEST_CARD_BORDER,
+        )
+        right_outer.grid(row=0, column=1, sticky=NSEW)
+
+        right_pad = tk.Frame(right_outer, bg=DEST_CARD_BG)
+        right_pad.pack(anchor=NW, fill=BOTH, expand=True, padx=16, pady=16)
+
+        # 右栏内容区 max 420px，窗口放大时右侧仅多出空白
+        right_shell = tk.Frame(right_pad, bg=DEST_CARD_BG, width=DEST_RIGHT_MAX_W)
+        right_shell.pack(fill=BOTH, expand=True)
+
+        # 右栏【动态表单内层】：仅 destroy 此层子组件
+        form_inner = tk.Frame(right_shell, bg=DEST_CARD_BG)
+        form_inner.pack(fill=BOTH, expand=True)
+
+        self.ui["dest_detail_outer"] = right_outer
+        self.ui["dest_form_inner"] = form_inner
+        self.ui["dest_detail_host"] = form_inner  # 兼容旧引用
+
+        self._show_dest_detail_placeholder()
+        self._refresh_dest_cards()
 
     def _build_filter(self, parent=None):
         host = parent if parent is not None else self.tab_filter
@@ -2572,52 +3113,187 @@ class App(tb.Window):
         messagebox.showinfo(i18n.t("ok"), i18n.t("misc_toast_test_ok"))
 
     def test_telegram(self):
-        token = self.var_tg_token.get().strip()
-        chat_id = self.var_tg_chat.get().strip()
-        if not token or not chat_id:
-            messagebox.showwarning(i18n.t("missing"), "Fill Telegram token & chat_id")
-            return
-        try:
-            send_telegram(token, chat_id, "✅ Telegram Test: NekoLink OK")
-            messagebox.showinfo(i18n.t("ok"), "Telegram test sent")
-        except Exception as e:
-            messagebox.showerror(i18n.t("fail"), f"Telegram failed: {e}")
+        def validate():
+            if not self.var_tg_token.get().strip() or not self.var_tg_chat.get().strip():
+                return "Fill Telegram token & chat_id"
+            return None
+
+        def run():
+            send_telegram(self.var_tg_token.get().strip(), self.var_tg_chat.get().strip(), "✅ Telegram Test: NekoLink OK")
+
+        self._dest_test_async("Telegram", validate, run)
 
     def test_dingtalk(self):
-        webhook = self.var_dt_webhook.get().strip()
-        secret = self.var_dt_secret.get().strip()
-        if not webhook:
-            messagebox.showwarning(i18n.t("missing"), "Fill DingTalk webhook")
-            return
-        try:
-            send_dingtalk_text(webhook, secret, "✅ DingTalk Test: NekoLink OK")
-            messagebox.showinfo(i18n.t("ok"), "DingTalk test sent")
-        except Exception as e:
-            messagebox.showerror(i18n.t("fail"), f"DingTalk failed: {e}")
+        def validate():
+            if not self.var_dt_webhook.get().strip():
+                return "Fill DingTalk webhook"
+            return None
+
+        def run():
+            send_dingtalk_text(
+                self.var_dt_webhook.get().strip(),
+                self.var_dt_secret.get().strip(),
+                "✅ DingTalk Test: NekoLink OK",
+            )
+
+        self._dest_test_async("DingTalk", validate, run)
 
     def test_ntfy(self):
-        url = self.var_ntfy_url.get().strip()
-        if not url:
-            messagebox.showwarning(i18n.t("missing"), "Fill ntfy Topic URL")
-            return
-        try:
-            send_ntfy(url, "✅ ntfy Test: NekoLink OK", "NekoLink Test")
-            messagebox.showinfo(i18n.t("ok"), "ntfy test sent")
-        except Exception as e:
-            messagebox.showerror(i18n.t("fail"), f"ntfy failed: {e}")
+        def validate():
+            if not self.var_ntfy_url.get().strip():
+                return "Fill ntfy Topic URL"
+            return None
+
+        def run():
+            send_ntfy(self.var_ntfy_url.get().strip(), "✅ ntfy Test: NekoLink OK", "NekoLink Test")
+
+        self._dest_test_async("ntfy", validate, run)
 
     def test_gotify(self):
-        url = self.var_gotify_url.get().strip()
-        token = self.var_gotify_token.get().strip()
-        prio = self.safe_int(self.var_gotify_prio.get(), 5)
-        if not url or not token:
-            messagebox.showwarning(i18n.t("missing"), "Fill Gotify Server URL & App Token")
-            return
-        try:
-            send_gotify(url, token, "NekoLink", "✅ Gotify Test: NekoLink OK", priority=prio)
-            messagebox.showinfo(i18n.t("ok"), "Gotify test sent")
-        except Exception as e:
-            messagebox.showerror(i18n.t("fail"), f"Gotify failed: {e}")
+        def validate():
+            if not self.var_gotify_url.get().strip() or not self.var_gotify_token.get().strip():
+                return "Fill Gotify Server URL & App Token"
+            return None
+
+        def run():
+            send_gotify(
+                self.var_gotify_url.get().strip(),
+                self.var_gotify_token.get().strip(),
+                "NekoLink",
+                "✅ Gotify Test: NekoLink OK",
+                priority=self.safe_int(self.var_gotify_prio.get(), 5),
+            )
+
+        self._dest_test_async("Gotify", validate, run)
+
+    def test_custom_http(self):
+        def validate():
+            if not self.var_custom_http_url.get().strip():
+                return "Fill HTTP POST URL"
+            return None
+
+        def run():
+            title, text, payload = self._dest_test_content()
+            send_custom_http(
+                self.var_custom_http_url.get().strip(),
+                self.var_custom_http_headers.get(),
+                self.var_custom_http_body.get(),
+                payload,
+                self.collect_config(),
+            )
+
+        self._dest_test_async("HTTP POST", validate, run)
+
+    def test_feishu(self):
+        def validate():
+            if not self.var_feishu_webhook.get().strip():
+                return "Fill Feishu Webhook URL"
+            return None
+
+        def run():
+            _, text, _ = self._dest_test_content()
+            send_feishu(self.var_feishu_webhook.get().strip(), f"✅ Feishu Test\n{text}")
+
+        self._dest_test_async("Feishu", validate, run)
+
+    def test_pushdeer(self):
+        def validate():
+            if not self.var_pushdeer_key.get().strip():
+                return "Fill PushDeer Key"
+            return None
+
+        def run():
+            _, text, _ = self._dest_test_content()
+            send_pushdeer(self.var_pushdeer_key.get().strip(), "NekoLink Test", f"✅ PushDeer Test\n{text}")
+
+        self._dest_test_async("PushDeer", validate, run)
+
+    def test_bark(self):
+        def validate():
+            if not self.var_bark_key.get().strip():
+                return "Fill Bark API Key"
+            return None
+
+        def run():
+            _, text, _ = self._dest_test_content()
+            send_bark(
+                self.var_bark_key.get().strip(),
+                "NekoLink Test",
+                f"✅ Bark Test\n{text}",
+                sound=self.var_bark_sound.get().strip(),
+            )
+
+        self._dest_test_async("Bark", validate, run)
+
+    def test_pushplus(self):
+        def validate():
+            if not self.var_pushplus_token.get().strip():
+                return "Fill PushPlus token"
+            return None
+
+        def run():
+            _, text, _ = self._dest_test_content()
+            send_pushplus(self.var_pushplus_token.get().strip(), "NekoLink Test", f"✅ PushPlus Test\n{text}")
+
+        self._dest_test_async("PushPlus", validate, run)
+
+    def test_wxpusher(self):
+        def validate():
+            if not self.var_wxpusher_token.get().strip():
+                return "Fill WxPusher appToken"
+            return None
+
+        def run():
+            _, text, _ = self._dest_test_content()
+            send_wxpusher(
+                self.var_wxpusher_token.get().strip(),
+                self.var_wxpusher_topic.get().strip(),
+                "NekoLink Test",
+                f"✅ WxPusher Test\n{text}",
+            )
+
+        self._dest_test_async("WxPusher", validate, run)
+
+    def test_serverchan(self):
+        def validate():
+            if not self.var_serverchan_key.get().strip():
+                return "Fill ServerChan SendKey"
+            return None
+
+        def run():
+            _, text, _ = self._dest_test_content()
+            send_serverchan(self.var_serverchan_key.get().strip(), "NekoLink Test", f"✅ ServerChan Test\n{text}")
+
+        self._dest_test_async("ServerChan", validate, run)
+
+    def test_pushover(self):
+        def validate():
+            if not self.var_pushover_token.get().strip() or not self.var_pushover_user.get().strip():
+                return "Fill Pushover API Token & User Key"
+            return None
+
+        def run():
+            _, text, _ = self._dest_test_content()
+            send_pushover(
+                self.var_pushover_token.get().strip(),
+                self.var_pushover_user.get().strip(),
+                "NekoLink Test",
+                f"✅ Pushover Test\n{text}",
+            )
+
+        self._dest_test_async("Pushover", validate, run)
+
+    def test_wecom(self):
+        def validate():
+            if not self.var_wecom_webhook.get().strip():
+                return "Fill WeCom Webhook URL"
+            return None
+
+        def run():
+            _, text, _ = self._dest_test_content()
+            send_wecom(self.var_wecom_webhook.get().strip(), f"✅ WeCom Test\n{text}")
+
+        self._dest_test_async("WeCom", validate, run)
 
     def test_email(self):
         cfg = self.collect_config()
@@ -2661,6 +3337,8 @@ class App(tb.Window):
 
     # ---------- Config ----------
     def collect_config(self) -> BridgeConfig:
+        if hasattr(self, "_sync_dest_text_widgets"):
+            self._sync_dest_text_widgets()
         addrs = []
         device_aliases: dict = {}
         for iid in self.dev_tree.get_children():
@@ -2728,6 +3406,38 @@ class App(tb.Window):
             webhook_use_full_message=bool(
                 self.var_webhook_full.get() if hasattr(self, "var_webhook_full") else True
             ),
+
+            enable_custom_http=bool(self.var_custom_http_on.get()) if hasattr(self, "var_custom_http_on") else False,
+            custom_http_url=self.var_custom_http_url.get().strip() if hasattr(self, "var_custom_http_url") else "",
+            custom_http_headers_json=self.var_custom_http_headers.get() if hasattr(self, "var_custom_http_headers") else "{}",
+            custom_http_body_template=self.var_custom_http_body.get() if hasattr(self, "var_custom_http_body") else "",
+
+            enable_feishu=bool(self.var_feishu_on.get()) if hasattr(self, "var_feishu_on") else False,
+            feishu_webhook_url=self.var_feishu_webhook.get().strip() if hasattr(self, "var_feishu_webhook") else "",
+
+            enable_pushdeer=bool(self.var_pushdeer_on.get()) if hasattr(self, "var_pushdeer_on") else False,
+            pushdeer_key=self.var_pushdeer_key.get().strip() if hasattr(self, "var_pushdeer_key") else "",
+
+            enable_bark=bool(self.var_bark_on.get()) if hasattr(self, "var_bark_on") else False,
+            bark_api_key=self.var_bark_key.get().strip() if hasattr(self, "var_bark_key") else "",
+            bark_sound=self.var_bark_sound.get().strip() if hasattr(self, "var_bark_sound") else "",
+
+            enable_pushplus=bool(self.var_pushplus_on.get()) if hasattr(self, "var_pushplus_on") else False,
+            pushplus_token=self.var_pushplus_token.get().strip() if hasattr(self, "var_pushplus_token") else "",
+
+            enable_wxpusher=bool(self.var_wxpusher_on.get()) if hasattr(self, "var_wxpusher_on") else False,
+            wxpusher_app_token=self.var_wxpusher_token.get().strip() if hasattr(self, "var_wxpusher_token") else "",
+            wxpusher_topic_id=self.var_wxpusher_topic.get().strip() if hasattr(self, "var_wxpusher_topic") else "",
+
+            enable_serverchan=bool(self.var_serverchan_on.get()) if hasattr(self, "var_serverchan_on") else False,
+            serverchan_sendkey=self.var_serverchan_key.get().strip() if hasattr(self, "var_serverchan_key") else "",
+
+            enable_pushover=bool(self.var_pushover_on.get()) if hasattr(self, "var_pushover_on") else False,
+            pushover_api_token=self.var_pushover_token.get().strip() if hasattr(self, "var_pushover_token") else "",
+            pushover_user_key=self.var_pushover_user.get().strip() if hasattr(self, "var_pushover_user") else "",
+
+            enable_wecom=bool(self.var_wecom_on.get()) if hasattr(self, "var_wecom_on") else False,
+            wecom_webhook_url=self.var_wecom_webhook.get().strip() if hasattr(self, "var_wecom_webhook") else "",
 
             enable_email=bool(self.var_mail_on.get()),
             smtp_host=self.var_smtp_host.get().strip(),

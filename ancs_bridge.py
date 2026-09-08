@@ -321,9 +321,11 @@ def _dispatch_webhooks(
     cfg: "BridgeConfig",
     content_text: str,
     title_text: str,
+    payload: Optional[dict] = None,
     log: Optional[Callable[[str], None]] = None,
 ) -> None:
-    """按 GUI 开关并行发送 DingTalk / ntfy，单个失败不影响另一个。"""
+    """按 GUI 开关并行发送模板类推送渠道；单个失败不影响其他。"""
+    payload = payload or {}
     tasks: Dict[str, Callable[[], None]] = {}
     if cfg.enable_dingtalk:
         tasks["dingtalk"] = lambda: send_dingtalk(
@@ -333,20 +335,58 @@ def _dispatch_webhooks(
         tasks["ntfy"] = lambda: send_ntfy(
             getattr(cfg, "ntfy_url", ""), content_text, title_text, log=log
         )
+    if getattr(cfg, "enable_feishu", False):
+        tasks["feishu"] = lambda: send_feishu_safe(cfg.feishu_webhook_url, content_text, log=log)
+    if getattr(cfg, "enable_pushdeer", False):
+        tasks["pushdeer"] = lambda: send_pushdeer_safe(
+            cfg.pushdeer_key, title_text or "NekoLink", content_text, log=log
+        )
+    if getattr(cfg, "enable_bark", False):
+        tasks["bark"] = lambda: send_bark_safe(
+            cfg.bark_api_key, title_text or "NekoLink", content_text,
+            sound=getattr(cfg, "bark_sound", ""), log=log,
+        )
+    if getattr(cfg, "enable_pushplus", False):
+        tasks["pushplus"] = lambda: send_pushplus_safe(
+            cfg.pushplus_token, title_text or "NekoLink", content_text, log=log
+        )
+    if getattr(cfg, "enable_wxpusher", False):
+        tasks["wxpusher"] = lambda: send_wxpusher_safe(
+            cfg.wxpusher_app_token, cfg.wxpusher_topic_id,
+            title_text or "NekoLink", content_text, log=log,
+        )
+    if getattr(cfg, "enable_serverchan", False):
+        tasks["serverchan"] = lambda: send_serverchan_safe(
+            cfg.serverchan_sendkey, title_text or "NekoLink", content_text, log=log
+        )
+    if getattr(cfg, "enable_pushover", False):
+        tasks["pushover"] = lambda: send_pushover_safe(
+            cfg.pushover_api_token, cfg.pushover_user_key,
+            title_text or "NekoLink", content_text, log=log,
+        )
+    if getattr(cfg, "enable_wecom", False):
+        tasks["wecom"] = lambda: send_wecom_safe(cfg.wecom_webhook_url, content_text, log=log)
+    if getattr(cfg, "enable_custom_http", False):
+        tasks["custom_http"] = lambda: send_custom_http_from_cfg(cfg, payload, log=log)
     if not tasks:
         return
-    with ThreadPoolExecutor(max_workers=len(tasks)) as pool:
-        futures = {pool.submit(fn): name for name, fn in tasks.items()}
-        for fut in as_completed(futures):
-            name = futures[fut]
-            try:
-                fut.result()
-            except Exception as e:
-                msg = f"[WEBHOOK:{name}] failed: {e}"
-                if log:
-                    log(msg)
-                else:
-                    print(msg, flush=True)
+
+    def _run_all() -> None:
+        workers = min(len(tasks), 12)
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(fn): name for name, fn in tasks.items()}
+            for fut in as_completed(futures):
+                name = futures[fut]
+                try:
+                    fut.result()
+                except Exception as e:
+                    msg = f"[WEBHOOK:{name}] failed: {e}"
+                    if log:
+                        log(msg)
+                    else:
+                        print(msg, flush=True)
+
+    threading.Thread(target=_run_all, daemon=True).start()
 
 
 # -----------------------------
@@ -556,6 +596,50 @@ class BridgeConfig:
     # webhook / TG / Gotify / Email：true=发 raw 全文；false=发预览省略文本
     webhook_use_full_message: bool = True
 
+    # 通用自定义 HTTP POST
+    enable_custom_http: bool = False
+    custom_http_url: str = ""
+    custom_http_headers_json: str = "{}"
+    custom_http_body_template: str = (
+        '{"title":"{{title}}","msg":"{{msg}}","app":"{{app_name}}",'
+        '"device":"{{device_name}}","time":"{{date_time}}"}'
+    )
+
+    # 飞书群机器人
+    enable_feishu: bool = False
+    feishu_webhook_url: str = ""
+
+    # PushDeer
+    enable_pushdeer: bool = False
+    pushdeer_key: str = ""
+
+    # Bark (iOS)
+    enable_bark: bool = False
+    bark_api_key: str = ""
+    bark_sound: str = ""
+
+    # PushPlus
+    enable_pushplus: bool = False
+    pushplus_token: str = ""
+
+    # WxPusher
+    enable_wxpusher: bool = False
+    wxpusher_app_token: str = ""
+    wxpusher_topic_id: str = ""
+
+    # ServerChan (Server酱)
+    enable_serverchan: bool = False
+    serverchan_sendkey: str = ""
+
+    # Pushover
+    enable_pushover: bool = False
+    pushover_api_token: str = ""
+    pushover_user_key: str = ""
+
+    # 企业微信群机器人
+    enable_wecom: bool = False
+    wecom_webhook_url: str = ""
+
     # behavior
     dedup_seconds: int = 8
 
@@ -699,6 +783,293 @@ def send_gotify(gotify_url: str, token: str, title: str, message: str, priority:
         # raise but keep body for debugging
         raise RuntimeError(f"HTTP {r.status_code}: {r.text}")
     # gotify normally returns JSON; ignore content here
+
+
+def _log_push_fail(channel: str, err: Exception, log: Optional[Callable[[str], None]] = None) -> None:
+    msg = f"[{channel}] failed: {err}"
+    if log:
+        log(msg)
+    else:
+        print(msg, flush=True)
+
+
+def render_http_body_template(template: str, payload: dict, cfg: Optional["BridgeConfig"] = None) -> str:
+    """自定义 HTTP Body 模板：支持 {{title}} {{msg}} {{app_name}} {{device_name}} {{date_time}}。"""
+    ctx = build_template_context(payload, cfg)
+    mapping = {
+        "title": ctx["title"],
+        "msg": ctx["msg"],
+        "app_name": ctx["app"],
+        "device_name": ctx["device"],
+        "date_time": ctx["date"],
+    }
+    out = template if template is not None else ""
+    for key, val in mapping.items():
+        out = out.replace("{{" + key + "}}", val)
+    return out
+
+
+def _parse_headers_json(headers_json: str) -> Dict[str, str]:
+    raw = (headers_json or "").strip()
+    if not raw:
+        return {}
+    obj = json.loads(raw)
+    if not isinstance(obj, dict):
+        raise ValueError("Headers JSON must be an object")
+    return {str(k): str(v) for k, v in obj.items()}
+
+
+def build_test_push_payload() -> dict:
+    """GUI Test 按钮使用的模拟通知 payload。"""
+    now = time.time()
+    return {
+        "device": "test-device",
+        "app": "com.tencent.xin",
+        "title": "测试发件人",
+        "msg": "这是一条测试消息",
+        "raw_title": "测试发件人",
+        "raw_msg": "这是一条测试消息",
+        "date": time.strftime("%Y%m%dT%H%M%S", time.localtime(now)),
+        "ts": now,
+        "battery": 88,
+        "codes": [],
+    }
+
+
+def send_custom_http(
+    url: str,
+    headers_json: str,
+    body_template: str,
+    payload: dict,
+    cfg: Optional["BridgeConfig"] = None,
+    timeout: int = 10,
+) -> None:
+    url = (url or "").strip()
+    if not _is_valid_http_url(url):
+        raise ValueError("Invalid custom HTTP URL")
+    headers = _parse_headers_json(headers_json)
+    if "Content-Type" not in headers and "content-type" not in {k.lower() for k in headers}:
+        headers["Content-Type"] = "application/json; charset=utf-8"
+    body_str = render_http_body_template(body_template, payload, cfg)
+    try:
+        body_obj = json.loads(body_str)
+        r = requests.post(url, json=body_obj, headers=headers, timeout=timeout)
+    except json.JSONDecodeError:
+        r = requests.post(url, data=body_str.encode("utf-8"), headers=headers, timeout=timeout)
+    if r.status_code >= 400:
+        raise RuntimeError(f"HTTP {r.status_code}: {r.text}")
+
+
+def send_feishu(webhook: str, text: str, timeout: int = 10) -> None:
+    webhook = (webhook or "").strip()
+    if not _is_valid_http_url(webhook):
+        raise ValueError("Invalid Feishu webhook URL")
+    data = {"msg_type": "text", "content": {"text": text}}
+    r = requests.post(webhook, json=data, timeout=timeout)
+    if r.status_code >= 400:
+        raise RuntimeError(f"HTTP {r.status_code}: {r.text}")
+    try:
+        j = r.json()
+        if j.get("code") not in (0, None):
+            raise RuntimeError(str(j))
+    except json.JSONDecodeError:
+        pass
+
+
+def send_pushdeer(key: str, title: str, text: str, timeout: int = 10) -> None:
+    key = (key or "").strip()
+    if not key:
+        raise ValueError("Missing PushDeer key")
+    url = "https://api2.pushdeer.com/message/push"
+    r = requests.post(url, data={"pushkey": key, "text": title, "desp": text}, timeout=timeout)
+    if r.status_code >= 400:
+        raise RuntimeError(f"HTTP {r.status_code}: {r.text}")
+    try:
+        j = r.json()
+        if j.get("code") not in (0, 200, None):
+            raise RuntimeError(str(j))
+    except json.JSONDecodeError:
+        pass
+
+
+def send_bark(api_key: str, title: str, body: str, sound: str = "", timeout: int = 10) -> None:
+    api_key = (api_key or "").strip()
+    if not api_key:
+        raise ValueError("Missing Bark api_key")
+    url = f"https://api.day.app/{urllib.parse.quote(api_key, safe='')}/push"
+    payload: Dict[str, str] = {"title": title, "body": body}
+    sound = (sound or "").strip()
+    if sound:
+        payload["sound"] = sound
+    r = requests.post(url, json=payload, timeout=timeout)
+    if r.status_code >= 400:
+        raise RuntimeError(f"HTTP {r.status_code}: {r.text}")
+
+
+def send_pushplus(token: str, title: str, content: str, timeout: int = 10) -> None:
+    token = (token or "").strip()
+    if not token:
+        raise ValueError("Missing PushPlus token")
+    url = "https://www.pushplus.plus/send"
+    r = requests.post(url, json={"token": token, "title": title, "content": content}, timeout=timeout)
+    if r.status_code >= 400:
+        raise RuntimeError(f"HTTP {r.status_code}: {r.text}")
+    try:
+        j = r.json()
+        if j.get("code") not in (200, 0, None):
+            raise RuntimeError(str(j))
+    except json.JSONDecodeError:
+        pass
+
+
+def send_wxpusher(app_token: str, topic_id: str, title: str, content: str, timeout: int = 10) -> None:
+    app_token = (app_token or "").strip()
+    if not app_token:
+        raise ValueError("Missing WxPusher appToken")
+    url = "https://wxpusher.zjiecode.com/api/send/message"
+    payload: Dict[str, object] = {
+        "appToken": app_token,
+        "content": content,
+        "summary": title,
+        "contentType": 1,
+    }
+    topic_id = (topic_id or "").strip()
+    if topic_id:
+        try:
+            payload["topicIds"] = [int(topic_id)]
+        except ValueError:
+            payload["topicIds"] = [topic_id]
+    r = requests.post(url, json=payload, timeout=timeout)
+    if r.status_code >= 400:
+        raise RuntimeError(f"HTTP {r.status_code}: {r.text}")
+    try:
+        j = r.json()
+        if j.get("code") not in (1000, 200, 0, None):
+            raise RuntimeError(str(j))
+    except json.JSONDecodeError:
+        pass
+
+
+def send_serverchan(sendkey: str, title: str, desp: str, timeout: int = 10) -> None:
+    sendkey = (sendkey or "").strip()
+    if not sendkey:
+        raise ValueError("Missing ServerChan SendKey")
+    url = f"https://sctapi.ftqq.com/{urllib.parse.quote(sendkey, safe='')}.send"
+    r = requests.post(url, data={"title": title, "desp": desp}, timeout=timeout)
+    if r.status_code >= 400:
+        raise RuntimeError(f"HTTP {r.status_code}: {r.text}")
+    try:
+        j = r.json()
+        if j.get("code") not in (0, 200, None):
+            raise RuntimeError(str(j))
+    except json.JSONDecodeError:
+        pass
+
+
+def send_pushover(api_token: str, user_key: str, title: str, message: str, timeout: int = 10) -> None:
+    api_token = (api_token or "").strip()
+    user_key = (user_key or "").strip()
+    if not api_token or not user_key:
+        raise ValueError("Missing Pushover api_token/user_key")
+    url = "https://api.pushover.net/1/messages.json"
+    r = requests.post(
+        url,
+        data={"token": api_token, "user": user_key, "title": title, "message": message},
+        timeout=timeout,
+    )
+    if r.status_code >= 400:
+        raise RuntimeError(f"HTTP {r.status_code}: {r.text}")
+    try:
+        j = r.json()
+        if j.get("status") not in (1, "1", None):
+            raise RuntimeError(str(j))
+    except json.JSONDecodeError:
+        pass
+
+
+def send_wecom(webhook: str, text: str, timeout: int = 10) -> None:
+    webhook = (webhook or "").strip()
+    if not _is_valid_http_url(webhook):
+        raise ValueError("Invalid WeCom webhook URL")
+    data = {"msgtype": "text", "text": {"content": text}}
+    r = requests.post(webhook, json=data, timeout=timeout)
+    if r.status_code >= 400:
+        raise RuntimeError(f"HTTP {r.status_code}: {r.text}")
+    try:
+        j = r.json()
+        if j.get("errcode", 0) != 0:
+            raise RuntimeError(str(j))
+    except json.JSONDecodeError:
+        pass
+
+
+def send_custom_http_from_cfg(cfg: "BridgeConfig", payload: dict, log=None) -> None:
+    try:
+        send_custom_http(
+            cfg.custom_http_url,
+            cfg.custom_http_headers_json,
+            cfg.custom_http_body_template,
+            payload,
+            cfg,
+        )
+    except Exception as e:
+        _log_push_fail("CustomHTTP", e, log)
+
+
+def send_feishu_safe(webhook: str, text: str, log=None) -> None:
+    try:
+        send_feishu(webhook, text)
+    except Exception as e:
+        _log_push_fail("Feishu", e, log)
+
+
+def send_pushdeer_safe(key: str, title: str, text: str, log=None) -> None:
+    try:
+        send_pushdeer(key, title, text)
+    except Exception as e:
+        _log_push_fail("PushDeer", e, log)
+
+
+def send_bark_safe(api_key: str, title: str, body: str, sound: str = "", log=None) -> None:
+    try:
+        send_bark(api_key, title, body, sound=sound)
+    except Exception as e:
+        _log_push_fail("Bark", e, log)
+
+
+def send_pushplus_safe(token: str, title: str, content: str, log=None) -> None:
+    try:
+        send_pushplus(token, title, content)
+    except Exception as e:
+        _log_push_fail("PushPlus", e, log)
+
+
+def send_wxpusher_safe(app_token: str, topic_id: str, title: str, content: str, log=None) -> None:
+    try:
+        send_wxpusher(app_token, topic_id, title, content)
+    except Exception as e:
+        _log_push_fail("WxPusher", e, log)
+
+
+def send_serverchan_safe(sendkey: str, title: str, desp: str, log=None) -> None:
+    try:
+        send_serverchan(sendkey, title, desp)
+    except Exception as e:
+        _log_push_fail("ServerChan", e, log)
+
+
+def send_pushover_safe(api_token: str, user_key: str, title: str, message: str, log=None) -> None:
+    try:
+        send_pushover(api_token, user_key, title, message)
+    except Exception as e:
+        _log_push_fail("Pushover", e, log)
+
+
+def send_wecom_safe(webhook: str, text: str, log=None) -> None:
+    try:
+        send_wecom(webhook, text)
+    except Exception as e:
+        _log_push_fail("WeCom", e, log)
 
 
 # -----------------------------
@@ -1117,7 +1488,7 @@ class BridgeManager:
         app_name = get_app_display_name(app_id, self.cfg)
         template = getattr(self.cfg, "push_template", "") or _default_push_template()
         content_text = render_push_template(template, payload, self.cfg)
-        _dispatch_webhooks(self.cfg, content_text, app_name, log=self.log)
+        _dispatch_webhooks(self.cfg, content_text, app_name, payload=payload, log=self.log)
 
     def _forward(self, payload: dict):
         cfg = self.cfg

@@ -223,6 +223,130 @@ def _draw_about(c, cx, cy, size, color):
     _line(c, cx, cy, size, [10, 17, 14, 17], color)
 
 
+def _draw_building(c, cx, cy, size, color):
+    _line(c, cx, cy, size, [6, 4, 6, 20, 18, 20, 18, 4, 6, 4], color)
+    _line(c, cx, cy, size, [10, 8, 10, 10, 14, 10, 14, 8], color)
+    _line(c, cx, cy, size, [10, 13, 10, 15, 14, 15, 14, 13], color)
+
+
+def _draw_globe(c, cx, cy, size, color):
+    _oval(c, cx, cy, size, 5, 5, 19, 19, outline=color, width=STROKE)
+    _line(c, cx, cy, size, [5, 12, 19, 12], color)
+    _line(c, cx, cy, size, [12, 5, 12, 19], color)
+
+
+def _draw_outbox(c, cx, cy, size, color):
+    _line(c, cx, cy, size, [5, 9, 19, 9, 19, 18, 5, 18, 5, 9], color)
+    _line(c, cx, cy, size, [12, 5, 12, 9], color)
+    _line(c, cx, cy, size, [10, 13, 12, 16, 14, 13], color)
+
+
+def _draw_link(c, cx, cy, size, color):
+    _arc(c, cx, cy, size, 5, 9, 11, 15, 60, 240, color)
+    _arc(c, cx, cy, size, 13, 9, 19, 15, -120, 240, color)
+
+
+def _draw_bird(c, cx, cy, size, color):
+    _poly(c, cx, cy, size, [5, 14, 12, 6, 19, 14], color, fill="")
+    _line(c, cx, cy, size, [8, 12, 16, 12], color)
+
+
+def _draw_inbox(c, cx, cy, size, color):
+    _line(c, cx, cy, size, [4, 9, 12, 15, 20, 9], color)
+    _line(c, cx, cy, size, [4, 9, 4, 18, 20, 18, 20, 9], color)
+
+
+def _draw_phone(c, cx, cy, size, color):
+    _line(c, cx, cy, size, [8, 4, 16, 4, 16, 20, 8, 20, 8, 4], color)
+    _line(c, cx, cy, size, [11, 17, 13, 17], color)
+
+
+def _draw_plus_badge(c, cx, cy, size, color):
+    _oval(c, cx, cy, size, 6, 6, 18, 18, outline=color, width=STROKE)
+    _line(c, cx, cy, size, [12, 8, 12, 16], color)
+    _line(c, cx, cy, size, [8, 12, 16, 12], color)
+
+
+def _draw_chat(c, cx, cy, size, color):
+    _line(c, cx, cy, size, [4, 6, 20, 6, 20, 13, 10, 13, 7, 17, 7, 13, 4, 13, 4, 6], color)
+
+
+def _draw_wechat(c, cx, cy, size, color):
+    _oval(c, cx, cy, size, 4, 7, 13, 16, outline=color, width=STROKE)
+    _oval(c, cx, cy, size, 11, 8, 20, 17, outline=color, width=STROKE)
+
+
+def _draw_paw(c, cx, cy, size, color):
+    _oval(c, cx, cy, size, 9, 11, 15, 17, outline=color, width=STROKE)
+    for x, y in ((6, 7), (16, 7), (8, 4), (14, 4)):
+        _oval(c, cx, cy, size, x, y, x + 3, y + 3, fill=color, outline="")
+
+
+_DEST_SERVICE_DRAWERS: Dict[str, Callable] = {
+    "telegram": _draw_plane,
+    "dingtalk": _draw_bell,
+    "ntfy": _draw_bell,
+    "webhook": _draw_globe,
+    "gotify": _draw_outbox,
+    "custom_http": _draw_link,
+    "feishu": _draw_bird,
+    "pushdeer": _draw_inbox,
+    "bark": _draw_phone,
+    "pushplus": _draw_plus_badge,
+    "wxpusher": _draw_chat,
+    "serverchan": _draw_wechat,
+    "pushover": _draw_paw,
+    "wecom": _draw_building,
+}
+
+DEST_ICON_COLOR = "#374151"
+
+
+def draw_dest_service_icon(
+    canvas: tk.Canvas,
+    service_key: str,
+    cx: float,
+    cy: float,
+    size: float = 28,
+    color: str = DEST_ICON_COLOR,
+) -> None:
+    """推送目标卡片：简洁线性图标（32px 视觉，48px 容器内居中）。"""
+    drawer = _DEST_SERVICE_DRAWERS.get(service_key, _draw_dest)
+    drawer(canvas, cx, cy, size, color)
+
+
+class DestServiceIcon(tk.Canvas):
+    """推送目标卡片图标：48×48 Canvas，线性 2px 描边。"""
+
+    def __init__(self, parent, service_key: str, bg: str = ICON_BG, **kwargs):
+        super().__init__(
+            parent,
+            width=48,
+            height=48,
+            bg=bg,
+            highlightthickness=0,
+            bd=0,
+            cursor="hand2",
+            **kwargs,
+        )
+        self._service_key = service_key
+        self._bg = bg
+        self._color = DEST_ICON_COLOR
+        self.bind("<Configure>", lambda _e: self.redraw())
+        self.redraw()
+
+    def set_style(self, bg: str, color: str | None = None) -> None:
+        self._bg = bg
+        if color is not None:
+            self._color = color
+        self.redraw()
+
+    def redraw(self) -> None:
+        self.delete("all")
+        self.configure(bg=self._bg)
+        draw_dest_service_icon(self, self._service_key, 24, 24, 28, self._color)
+
+
 _ICON_DRAWERS: Dict[str, Callable] = {
     "main": _draw_home,
     "history": _draw_history,
